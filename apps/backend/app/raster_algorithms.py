@@ -1196,7 +1196,7 @@ def _build_neighbor_lookup(
                     heartbeat_callback,
                     next_heartbeat_at,
                     (
-                        "D8 1/3 严格坡降：邻域索引预构建，"
+                        "D8 1/4 严格坡降：邻域索引预构建，"
                         f"方向 {direction_index + 1}/8，第 {row_index + 1}/{height} 行。"
                     ),
                 )
@@ -1226,7 +1226,7 @@ def _compute_strict_d8_pass(
             next_heartbeat_at = _emit_throttled_heartbeat(
                 heartbeat_callback,
                 next_heartbeat_at,
-                f"D8 1/3 严格坡降：正在扫描第 {row_index + 1}/{height} 行。",
+                f"D8 1/4 严格坡降：正在扫描第 {row_index + 1}/{height} 行。",
             )
             current_height = float(height_array[row_index, column_index])
             raw_slopes = np.zeros(8, dtype=np.float32)
@@ -1258,7 +1258,7 @@ def _compute_strict_d8_pass(
             )
 
         if progress_callback is not None:
-            progress_callback(f"D8 1/3 严格坡降：已完成 {row_index + 1}/{height} 行。")
+            progress_callback(f"D8 1/4 严格坡降：已完成 {row_index + 1}/{height} 行。")
 
     return direction_array
 
@@ -1322,7 +1322,7 @@ def _build_flat_region_labels_python(
                 heartbeat_callback,
                 next_heartbeat_at,
                 (
-                    "D8 2/3 平坡导流：平坡分区标记，"
+                    "D8 2/4 平坡导流：平坡分区标记，"
                     f"正在扫描第 {row_index + 1}/{height} 行，已发现 {current_label} 个平坡区。"
                 ),
             )
@@ -1482,34 +1482,20 @@ def _extract_outlet_segments(
     neighbor_rows: np.ndarray,
     neighbor_columns: np.ndarray,
     flat_outlet_length_weight: float,
-    region_labels: np.ndarray | None = None,
     heartbeat_callback: ProgressCallback | None = None,
-    use_rust_kernel: bool = False,
+    outlet_drop_map: np.ndarray | None = None,
 ) -> list[dict[str, object]]:
     """Find grouped outlet segments for one flat region."""
 
     region_lookup = set(region_cells)
     outlet_candidates: list[tuple[int, int, float]] = []
-    outlet_drop_map: np.ndarray | None = None
     next_heartbeat_at = monotonic() + 0.75
-
-    if (
-        use_rust_kernel
-        and rust_kernel_available()
-        and region_labels is not None
-    ):
-        outlet_drop_map = compute_flat_outlet_drop_map_rust(
-            height_array,
-            valid_mask,
-            region_labels,
-            progress_callback=heartbeat_callback,
-        )
 
     for scanned_cells, (row_index, column_index) in enumerate(region_cells, start=1):
         next_heartbeat_at = _emit_throttled_heartbeat(
             heartbeat_callback,
             next_heartbeat_at,
-            f"D8 2/3 平坡导流：正在搜索出口，已扫描 {scanned_cells}/{len(region_cells)} 个像素。",
+            f"D8 2/4 平坡导流：正在搜索出口，已扫描 {scanned_cells}/{len(region_cells)} 个像素。",
         )
         if outlet_drop_map is not None:
             strongest_drop = float(outlet_drop_map[row_index, column_index])
@@ -1594,7 +1580,7 @@ def _assign_flat_region_segments(
         next_heartbeat_at = _emit_throttled_heartbeat(
             heartbeat_callback,
             next_heartbeat_at,
-            f"D8 2/3 平坡导流：正在扩散出口归属，待处理队列 {len(pending_cells)}。",
+            f"D8 2/4 平坡导流：正在扩散出口归属，待处理队列 {len(pending_cells)}。",
         )
 
         for direction_index in range(8):
@@ -1710,10 +1696,17 @@ def _resolve_flat_regions(
     """Assign flow directions inside flat regions that have real downstream outlets."""
 
     resolved_directions = direction_array.copy()
+    outlet_drop_map: np.ndarray | None = None
     if use_rust_kernel and rust_kernel_available():
         region_labels = label_equal_height_regions_rust(
             height_array,
             valid_mask,
+            progress_callback=heartbeat_callback,
+        )
+        outlet_drop_map = compute_flat_outlet_drop_map_rust(
+            height_array,
+            valid_mask,
+            region_labels,
             progress_callback=heartbeat_callback,
         )
     else:
@@ -1733,7 +1726,7 @@ def _resolve_flat_regions(
     for region_offset, (_, region_cells) in enumerate(region_items, start=1):
         if heartbeat_callback is not None and monotonic() >= next_heartbeat_at:
             heartbeat_callback(
-                f"D8 2/3 平坡导流：正在处理第 {region_offset}/{max(total_regions, 1)} 个平坡区。"
+                f"D8 2/4 平坡导流：正在处理第 {region_offset}/{max(total_regions, 1)} 个平坡区。"
             )
             next_heartbeat_at = monotonic() + 0.75
         if len(region_cells) <= 1:
@@ -1748,9 +1741,8 @@ def _resolve_flat_regions(
             neighbor_rows,
             neighbor_columns,
             flat_outlet_length_weight,
-            region_labels=region_labels,
             heartbeat_callback=heartbeat_callback,
-            use_rust_kernel=use_rust_kernel,
+            outlet_drop_map=outlet_drop_map,
         )
         if not outlet_segments:
             continue
@@ -1768,7 +1760,7 @@ def _resolve_flat_regions(
         for cell_offset, (region_row, region_column) in enumerate(region_cells, start=1):
             if heartbeat_callback is not None and monotonic() >= next_heartbeat_at:
                 heartbeat_callback(
-                    "D8 2/3 平坡导流："
+                    "D8 2/4 平坡导流："
                     f"第 {region_offset}/{max(total_regions, 1)} 个平坡区，"
                     f"已扫描 {cell_offset}/{total_region_cells} 个像素。"
                 )
@@ -1798,7 +1790,7 @@ def _resolve_flat_regions(
                 resolved_directions[region_row, region_column] = best_direction
 
         if progress_callback is not None:
-            progress_callback(f"D8 2/3 平坡导流：已完成 {region_offset}/{max(total_regions, 1)} 个平坡区。")
+            progress_callback(f"D8 2/4 平坡导流：已完成 {region_offset}/{max(total_regions, 1)} 个平坡区。")
 
     return resolved_directions
 
@@ -1837,15 +1829,54 @@ def _collect_unresolved_component(
     return component_cells
 
 
+def _trace_flow_outcome(
+    start_row: int,
+    start_column: int,
+    direction_array: np.ndarray,
+    valid_mask: np.ndarray,
+    component_mask: np.ndarray,
+) -> str:
+    """Classify whether one downstream trace safely exits or falls into a cycle."""
+
+    height, width = direction_array.shape
+    visited_cells: set[tuple[int, int]] = set()
+    row_index = start_row
+    column_index = start_column
+
+    while True:
+        if row_index < 0 or row_index >= height or column_index < 0 or column_index >= width:
+            return "exit"
+        if not valid_mask[row_index, column_index]:
+            return "exit"
+        if component_mask[row_index, column_index]:
+            return "component"
+
+        current_cell = (row_index, column_index)
+        if current_cell in visited_cells:
+            return "cycle"
+        visited_cells.add(current_cell)
+
+        direction_index = int(direction_array[row_index, column_index])
+        if direction_index < 0:
+            return "exit"
+
+        row_delta, column_delta = D8_OFFSETS[direction_index]
+        row_index += row_delta
+        column_index += column_delta
+
+
 def _choose_component_exit(
     component_cells: list[tuple[int, int]],
     height_array: np.ndarray,
     valid_mask: np.ndarray,
     component_mask: np.ndarray,
+    direction_array: np.ndarray,
+    allow_unsafe_external: bool = True,
 ) -> tuple[tuple[int, int], int] | None:
     """Choose the least-cost escape edge for one unresolved component."""
 
     height, width = height_array.shape
+    best_safe_external_candidate: tuple[float, float, int, int, int] | None = None
     best_external_candidate: tuple[float, float, int, int, int] | None = None
     best_border_candidate: tuple[int, int, int] | None = None
 
@@ -1862,6 +1893,9 @@ def _choose_component_exit(
                 continue
 
             if not valid_mask[neighbor_row, neighbor_column]:
+                border_candidate = (row_index, column_index, direction_index)
+                if best_border_candidate is None or border_candidate < best_border_candidate:
+                    best_border_candidate = border_candidate
                 continue
             if component_mask[neighbor_row, neighbor_column]:
                 continue
@@ -1874,18 +1908,159 @@ def _choose_component_exit(
                 column_index,
                 direction_index,
             )
+            trace_outcome = _trace_flow_outcome(
+                neighbor_row,
+                neighbor_column,
+                direction_array,
+                valid_mask,
+                component_mask,
+            )
+            if trace_outcome == "exit":
+                if best_safe_external_candidate is None or candidate_key < best_safe_external_candidate:
+                    best_safe_external_candidate = candidate_key
             if best_external_candidate is None or candidate_key < best_external_candidate:
                 best_external_candidate = candidate_key
 
-    if best_external_candidate is not None:
-        _, _, row_index, column_index, direction_index = best_external_candidate
+    if best_safe_external_candidate is not None:
+        _, _, row_index, column_index, direction_index = best_safe_external_candidate
         return (row_index, column_index), direction_index
 
     if best_border_candidate is not None:
         row_index, column_index, direction_index = best_border_candidate
         return (row_index, column_index), direction_index
 
+    if allow_unsafe_external and best_external_candidate is not None:
+        _, _, row_index, column_index, direction_index = best_external_candidate
+        return (row_index, column_index), direction_index
+
     return None
+
+
+def _expand_component_toward_exit(
+    seed_cells: list[tuple[int, int]],
+    height_array: np.ndarray,
+    valid_mask: np.ndarray,
+    direction_array: np.ndarray,
+    heartbeat_callback: ProgressCallback | None = None,
+    heartbeat_label: str = "",
+    allow_unsafe_external: bool = True,
+) -> tuple[list[tuple[int, int]], np.ndarray, tuple[tuple[int, int], int] | None]:
+    """
+    Grow one repair component along direct upstream backflow edges until an exit is found.
+
+    This keeps expansion linear in the number of newly absorbed cells instead of
+    repeatedly rescanning the full component boundary after every growth step.
+    """
+
+    component_mask = np.zeros_like(valid_mask, dtype=bool)
+    component_cells: list[tuple[int, int]] = []
+    pending_cells: deque[tuple[int, int]] = deque()
+    height, width = height_array.shape
+    next_heartbeat_at = monotonic() + 0.75
+
+    for row_index, column_index in seed_cells:
+        if component_mask[row_index, column_index]:
+            continue
+        component_mask[row_index, column_index] = True
+        component_cells.append((row_index, column_index))
+        pending_cells.append((row_index, column_index))
+
+    direct_exit_choice = _choose_component_exit(
+        component_cells,
+        height_array,
+        valid_mask,
+        component_mask,
+        direction_array,
+        allow_unsafe_external=False,
+    )
+    if direct_exit_choice is not None:
+        return component_cells, component_mask, direct_exit_choice
+
+    best_safe_external_candidate: tuple[float, float, int, int, int] | None = None
+    best_external_candidate: tuple[float, float, int, int, int] | None = None
+    best_border_candidate: tuple[int, int, int] | None = None
+
+    while pending_cells and best_safe_external_candidate is None:
+        row_index, column_index = pending_cells.popleft()
+        current_height = float(height_array[row_index, column_index])
+        next_heartbeat_at = _emit_throttled_heartbeat(
+            heartbeat_callback,
+            next_heartbeat_at,
+            heartbeat_label
+            or (
+                "流向修复组件扩张："
+                f"已吸收 {len(component_cells)} 个像素，待处理队列 {len(pending_cells)}。"
+            ),
+        )
+
+        for direction_index, (row_delta, column_delta) in enumerate(D8_OFFSETS):
+            neighbor_row = row_index + row_delta
+            neighbor_column = column_index + column_delta
+
+            if neighbor_row < 0 or neighbor_row >= height or neighbor_column < 0 or neighbor_column >= width:
+                border_candidate = (row_index, column_index, direction_index)
+                if best_border_candidate is None or border_candidate < best_border_candidate:
+                    best_border_candidate = border_candidate
+                continue
+
+            if not valid_mask[neighbor_row, neighbor_column]:
+                border_candidate = (row_index, column_index, direction_index)
+                if best_border_candidate is None or border_candidate < best_border_candidate:
+                    best_border_candidate = border_candidate
+                continue
+            if component_mask[neighbor_row, neighbor_column]:
+                continue
+
+            neighbor_direction = int(direction_array[neighbor_row, neighbor_column])
+            if neighbor_direction >= 0:
+                target_row = neighbor_row + D8_OFFSETS[neighbor_direction][0]
+                target_column = neighbor_column + D8_OFFSETS[neighbor_direction][1]
+                if (
+                    0 <= target_row < height
+                    and 0 <= target_column < width
+                    and component_mask[target_row, target_column]
+                ):
+                    component_mask[neighbor_row, neighbor_column] = True
+                    component_cells.append((neighbor_row, neighbor_column))
+                    pending_cells.append((neighbor_row, neighbor_column))
+                    continue
+
+            neighbor_height = float(height_array[neighbor_row, neighbor_column])
+            candidate_key = (
+                neighbor_height - current_height,
+                neighbor_height,
+                row_index,
+                column_index,
+                direction_index,
+            )
+            trace_outcome = _trace_flow_outcome(
+                neighbor_row,
+                neighbor_column,
+                direction_array,
+                valid_mask,
+                component_mask,
+            )
+            if trace_outcome == "exit":
+                if (
+                    best_safe_external_candidate is None
+                    or candidate_key < best_safe_external_candidate
+                ):
+                    best_safe_external_candidate = candidate_key
+            if best_external_candidate is None or candidate_key < best_external_candidate:
+                best_external_candidate = candidate_key
+
+    exit_choice: tuple[tuple[int, int], int] | None = None
+    if best_safe_external_candidate is not None:
+        _, _, row_index, column_index, direction_index = best_safe_external_candidate
+        exit_choice = ((row_index, column_index), direction_index)
+    elif best_border_candidate is not None:
+        row_index, column_index, direction_index = best_border_candidate
+        exit_choice = ((row_index, column_index), direction_index)
+    elif allow_unsafe_external and best_external_candidate is not None:
+        _, _, row_index, column_index, direction_index = best_external_candidate
+        exit_choice = ((row_index, column_index), direction_index)
+
+    return component_cells, component_mask, exit_choice
 
 
 def _assign_component_flow_toward_exit(
@@ -1956,6 +2131,170 @@ def _assign_component_flow_toward_exit(
             direction_array[row_index, column_index] = np.int8(best_direction)
 
 
+def _collect_cycle_components(
+    direction_array: np.ndarray,
+    valid_mask: np.ndarray,
+) -> list[list[tuple[int, int]]]:
+    """Return all directed flow cycles that remain after indegree stripping."""
+
+    height, width = direction_array.shape
+    downstream_row = np.full((height, width), -1, dtype=np.int32)
+    downstream_column = np.full((height, width), -1, dtype=np.int32)
+    indegree = np.zeros((height, width), dtype=np.int32)
+    active_mask = valid_mask & (direction_array >= 0)
+
+    for row_index in range(height):
+        for column_index in range(width):
+            if not active_mask[row_index, column_index]:
+                continue
+
+            direction_index = int(direction_array[row_index, column_index])
+            row_delta, column_delta = D8_OFFSETS[direction_index]
+            neighbor_row = row_index + row_delta
+            neighbor_column = column_index + column_delta
+            if neighbor_row < 0 or neighbor_row >= height or neighbor_column < 0 or neighbor_column >= width:
+                continue
+            if not active_mask[neighbor_row, neighbor_column]:
+                continue
+
+            downstream_row[row_index, column_index] = neighbor_row
+            downstream_column[row_index, column_index] = neighbor_column
+            indegree[neighbor_row, neighbor_column] += 1
+
+    processing_queue: deque[tuple[int, int]] = deque()
+    for row_index in range(height):
+        for column_index in range(width):
+            if active_mask[row_index, column_index] and indegree[row_index, column_index] == 0:
+                processing_queue.append((row_index, column_index))
+
+    while processing_queue:
+        row_index, column_index = processing_queue.popleft()
+        target_row = int(downstream_row[row_index, column_index])
+        target_column = int(downstream_column[row_index, column_index])
+        if target_row < 0 or target_column < 0:
+            continue
+
+        indegree[target_row, target_column] -= 1
+        if indegree[target_row, target_column] == 0:
+            processing_queue.append((target_row, target_column))
+
+    cycle_mask = active_mask & (indegree > 0)
+    if not cycle_mask.any():
+        return []
+
+    cycle_components: list[list[tuple[int, int]]] = []
+    visited_cells: set[tuple[int, int]] = set()
+    cycle_rows, cycle_columns = np.nonzero(cycle_mask)
+    for start_row, start_column in zip(cycle_rows.tolist(), cycle_columns.tolist()):
+        start_cell = (start_row, start_column)
+        if start_cell in visited_cells:
+            continue
+
+        traversal_order: dict[tuple[int, int], int] = {}
+        traversal_path: list[tuple[int, int]] = []
+        current_cell = start_cell
+        while current_cell not in traversal_order:
+            traversal_order[current_cell] = len(traversal_path)
+            traversal_path.append(current_cell)
+            visited_cells.add(current_cell)
+            current_row, current_column = current_cell
+            next_row = int(downstream_row[current_row, current_column])
+            next_column = int(downstream_column[current_row, current_column])
+            next_cell = (next_row, next_column)
+            if next_row < 0 or next_column < 0 or not cycle_mask[next_row, next_column]:
+                current_cell = next_cell
+                break
+            current_cell = next_cell
+
+        if current_cell in traversal_order:
+            cycle_components.append(traversal_path[traversal_order[current_cell] :])
+
+    return cycle_components
+
+
+def _repair_flow_cycles(
+    height_array: np.ndarray,
+    valid_mask: np.ndarray,
+    direction_array: np.ndarray,
+    neighbor_rows: np.ndarray,
+    neighbor_columns: np.ndarray,
+    progress_callback: ProgressCallback | None = None,
+    heartbeat_callback: ProgressCallback | None = None,
+) -> np.ndarray:
+    """Break residual flow cycles by reconnecting one edge of each cycle to a safe exit."""
+
+    repaired_directions = direction_array.copy()
+
+    for repair_pass in range(1, 17):
+        cycle_components = _collect_cycle_components(repaired_directions, valid_mask)
+        if not cycle_components:
+            if progress_callback is not None:
+                progress_callback("D8 4/4 去环修复：未检测到流向环路。")
+            return repaired_directions
+
+        current_cycle_node_count = sum(len(component) for component in cycle_components)
+        if progress_callback is not None:
+            progress_callback(
+                (
+                    "D8 4/4 去环修复："
+                    f"第 {repair_pass} 轮检测到 {len(cycle_components)} 个环，"
+                    f"共 {current_cycle_node_count} 个像素。"
+                )
+            )
+        if heartbeat_callback is not None:
+            heartbeat_callback(
+                (
+                    "D8 4/4 去环修复："
+                    f"开始处理 {len(cycle_components)} 个环，"
+                    f"共 {current_cycle_node_count} 个像素。"
+                )
+            )
+
+        repaired_cycles = 0
+        for cycle_index, cycle_cells in enumerate(cycle_components, start=1):
+            repair_cells, component_mask, exit_choice = _expand_component_toward_exit(
+                cycle_cells,
+                height_array,
+                valid_mask,
+                repaired_directions,
+                heartbeat_callback=heartbeat_callback,
+                heartbeat_label=(
+                    "D8 4/4 去环修复："
+                    f"第 {cycle_index}/{len(cycle_components)} 个环正在扩张修复组件，"
+                    f"当前环大小 {len(cycle_cells)}。"
+                ),
+                allow_unsafe_external=True,
+            )
+            if exit_choice is None:
+                continue
+
+            anchor_cell, exit_direction = exit_choice
+            _assign_component_flow_toward_exit(
+                repaired_directions,
+                repair_cells,
+                anchor_cell,
+                exit_direction,
+                height_array,
+                component_mask,
+                neighbor_rows,
+                neighbor_columns,
+            )
+            repaired_cycles += 1
+
+            if progress_callback is not None:
+                progress_callback(
+                    (
+                        "D8 4/4 去环修复："
+                        f"已修复 {cycle_index}/{len(cycle_components)} 个环。"
+                    )
+                )
+
+        if repaired_cycles == 0:
+            break
+
+    return repaired_directions
+
+
 def _resolve_residual_unassigned_flows(
     height_array: np.ndarray,
     valid_mask: np.ndarray,
@@ -1971,7 +2310,7 @@ def _resolve_residual_unassigned_flows(
     unresolved_mask = valid_mask & (resolved_directions < 0)
     if not unresolved_mask.any():
         if progress_callback is not None:
-            progress_callback("D8 3/3 断流兜底：未检测到无流向像素，跳过。")
+            progress_callback("D8 3/4 断流兜底：未检测到无流向像素，跳过。")
         return resolved_directions
 
     visited = np.zeros_like(unresolved_mask, dtype=bool)
@@ -1982,7 +2321,7 @@ def _resolve_residual_unassigned_flows(
 
     if progress_callback is not None:
         progress_callback(
-            f"D8 3/3 断流兜底：检测到 {total_unresolved} 个无流向像素，开始强制连通修复。"
+            f"D8 3/4 断流兜底：检测到 {total_unresolved} 个无流向像素，开始强制连通修复。"
         )
 
     for row_index, column_index in zip(unresolved_rows.tolist(), unresolved_columns.tolist()):
@@ -1997,24 +2336,26 @@ def _resolve_residual_unassigned_flows(
             neighbor_rows,
             neighbor_columns,
         )
-        component_mask = np.zeros_like(unresolved_mask, dtype=bool)
-        for component_row, component_column in component_cells:
-            component_mask[component_row, component_column] = True
-
         next_heartbeat_at = _emit_throttled_heartbeat(
             heartbeat_callback,
             next_heartbeat_at,
             (
-                "D8 3/3 断流兜底："
+                "D8 3/4 断流兜底："
                 f"正在修复大小为 {len(component_cells)} 的无流向区域，"
                 f"剩余无流向像素约 {int((resolved_directions < 0).sum())}/{total_unresolved}。"
             ),
         )
-        exit_choice = _choose_component_exit(
+        repair_cells, component_mask, exit_choice = _expand_component_toward_exit(
             component_cells,
             height_array,
             valid_mask,
-            component_mask,
+            resolved_directions,
+            heartbeat_callback=heartbeat_callback,
+            heartbeat_label=(
+                "D8 3/4 断流兜底："
+                f"正在扩张大小为 {len(component_cells)} 的无流向区域修复组件。"
+            ),
+            allow_unsafe_external=True,
         )
         if exit_choice is None:
             continue
@@ -2022,7 +2363,7 @@ def _resolve_residual_unassigned_flows(
         anchor_cell, exit_direction = exit_choice
         _assign_component_flow_toward_exit(
             resolved_directions,
-            component_cells,
+            repair_cells,
             anchor_cell,
             exit_direction,
             height_array,
@@ -2035,7 +2376,7 @@ def _resolve_residual_unassigned_flows(
         if progress_callback is not None:
             progress_callback(
                 (
-                    "D8 3/3 断流兜底："
+                    "D8 3/4 断流兜底："
                     f"已修复 {resolved_components} 个无流向区域，"
                     f"当前剩余 {int((resolved_directions < 0).sum())}/{total_unresolved} 个像素。"
                 )
@@ -2060,6 +2401,8 @@ def compute_d8_flow_directions(
     strict_heartbeat_callback: ProgressCallback | None = None,
     flat_heartbeat_callback: ProgressCallback | None = None,
     residual_heartbeat_callback: ProgressCallback | None = None,
+    cycle_progress_callback: ProgressCallback | None = None,
+    cycle_heartbeat_callback: ProgressCallback | None = None,
 ) -> np.ndarray:
     """Compute one downstream direction for each terrain cell, including flat routing."""
 
@@ -2104,7 +2447,7 @@ def compute_d8_flow_directions(
         heartbeat_callback=flat_heartbeat_callback,
         use_rust_kernel=use_rust_kernel,
     )
-    return _resolve_residual_unassigned_flows(
+    direction_array = _resolve_residual_unassigned_flows(
         height_array,
         working_valid_mask,
         direction_array,
@@ -2112,6 +2455,15 @@ def compute_d8_flow_directions(
         neighbor_columns,
         progress_callback=residual_progress_callback,
         heartbeat_callback=residual_heartbeat_callback or flat_heartbeat_callback,
+    )
+    return _repair_flow_cycles(
+        height_array,
+        working_valid_mask,
+        direction_array,
+        neighbor_rows,
+        neighbor_columns,
+        progress_callback=cycle_progress_callback,
+        heartbeat_callback=cycle_heartbeat_callback or residual_heartbeat_callback or flat_heartbeat_callback,
     )
 
 
@@ -2211,6 +2563,16 @@ def compute_flow_accumulation(
                 f"汇流传播：已处理 {processed_nodes}/{total_nodes} 个像素节点。"
             )
 
+    cyclic_node_count = int((indegree > 0).sum())
+    if cyclic_node_count > 0:
+        cycle_message = (
+            "汇流传播检测到流向环路："
+            f"仍有 {cyclic_node_count} 个像素节点未完成拓扑传播。"
+        )
+        if heartbeat_callback is not None:
+            heartbeat_callback(cycle_message)
+        raise ValueError(cycle_message)
+
     return accumulation
 
 
@@ -2232,14 +2594,111 @@ def accumulation_preview_image(
     return Image.fromarray(normalized, mode="L")
 
 
+def _compute_edge_contact_mask(
+    valid_mask: np.ndarray,
+    progress_callback: ProgressCallback | None = None,
+    heartbeat_callback: ProgressCallback | None = None,
+) -> np.ndarray:
+    """Return valid pixels that touch the image edge or an invalid-mask neighbor."""
+
+    height, width = valid_mask.shape
+    padded_valid = np.pad(valid_mask.astype(bool, copy=False), 1, mode="constant", constant_values=False)
+    edge_contact_mask = np.zeros_like(valid_mask, dtype=bool)
+    next_heartbeat_at = monotonic() + 0.75
+
+    for direction_index, (row_delta, column_delta) in enumerate(D8_OFFSETS):
+        neighbor_valid = padded_valid[
+            1 + row_delta : 1 + row_delta + height,
+            1 + column_delta : 1 + column_delta + width,
+        ]
+        edge_contact_mask |= ~neighbor_valid
+        next_heartbeat_at = _emit_throttled_heartbeat(
+            heartbeat_callback,
+            next_heartbeat_at,
+            f"河道边缘终止分析：正在检查第 {direction_index + 1}/8 个邻域方向。",
+        )
+        if progress_callback is not None:
+            progress_callback(f"河道边缘终止分析：已完成第 {direction_index + 1}/8 个邻域方向。")
+
+    return edge_contact_mask & valid_mask
+
+
+def _trim_edge_following_channels(
+    channel_mask: np.ndarray,
+    direction_array: np.ndarray,
+    edge_contact_mask: np.ndarray,
+    progress_callback: ProgressCallback | None = None,
+    heartbeat_callback: ProgressCallback | None = None,
+) -> np.ndarray:
+    """Keep only the first edge-touching pixel and trim downstream edge walking."""
+
+    height, width = channel_mask.shape
+    candidate_mask = channel_mask.astype(bool, copy=False)
+    if not candidate_mask.any():
+        return channel_mask.astype(np.uint8, copy=True)
+
+    boundary_channel_mask = candidate_mask & edge_contact_mask
+    if not boundary_channel_mask.any():
+        if progress_callback is not None:
+            progress_callback("河道边缘终止分析：未检测到触边河道，跳过裁剪。")
+        return channel_mask.astype(np.uint8, copy=True)
+
+    has_upstream_boundary = np.zeros_like(candidate_mask, dtype=bool)
+    has_upstream_interior = np.zeros_like(candidate_mask, dtype=bool)
+    next_heartbeat_at = monotonic() + 0.75
+
+    for row_index in range(height):
+        for column_index in range(width):
+            next_heartbeat_at = _emit_throttled_heartbeat(
+                heartbeat_callback,
+                next_heartbeat_at,
+                f"河道边缘终止分析：正在扫描第 {row_index + 1}/{height} 行的流向连接。",
+            )
+            if not candidate_mask[row_index, column_index]:
+                continue
+
+            direction_index = int(direction_array[row_index, column_index])
+            if direction_index < 0:
+                continue
+
+            row_delta, column_delta = D8_OFFSETS[direction_index]
+            neighbor_row = row_index + row_delta
+            neighbor_column = column_index + column_delta
+            if neighbor_row < 0 or neighbor_row >= height or neighbor_column < 0 or neighbor_column >= width:
+                continue
+            if not candidate_mask[neighbor_row, neighbor_column]:
+                continue
+
+            if boundary_channel_mask[row_index, column_index]:
+                has_upstream_boundary[neighbor_row, neighbor_column] = True
+            else:
+                has_upstream_interior[neighbor_row, neighbor_column] = True
+
+        if progress_callback is not None:
+            progress_callback(f"河道边缘终止分析：已完成 {row_index + 1}/{height} 行流向连接扫描。")
+
+    keep_boundary_mask = boundary_channel_mask & (
+        has_upstream_interior | ~(has_upstream_boundary | has_upstream_interior)
+    )
+    trimmed_mask = (candidate_mask & ~boundary_channel_mask) | keep_boundary_mask
+
+    if progress_callback is not None:
+        removed_pixels = int(candidate_mask.sum() - trimmed_mask.sum())
+        progress_callback(f"河道边缘终止分析：已裁剪 {removed_pixels} 个沿边缘行走的河道像素。")
+
+    return trimmed_mask.astype(np.uint8, copy=False)
+
+
 def build_channel_mask(
     accumulation: np.ndarray,
     threshold: float,
     valid_mask: np.ndarray | None = None,
+    direction_array: np.ndarray | None = None,
+    channel_length_threshold: int = 1,
     progress_callback: ProgressCallback | None = None,
     heartbeat_callback: ProgressCallback | None = None,
 ) -> np.ndarray:
-    """Threshold an accumulation raster into a binary channel mask."""
+    """Threshold an accumulation raster into a post-processed binary channel mask."""
 
     height, width = accumulation.shape
     channel_mask = np.zeros((height, width), dtype=np.uint8)
@@ -2256,6 +2715,35 @@ def build_channel_mask(
         )
         if progress_callback is not None:
             progress_callback(f"河道阈值提取：已完成 {row_index + 1}/{height} 行。")
+
+    if valid_mask is not None and direction_array is not None:
+        edge_contact_mask = _compute_edge_contact_mask(
+            valid_mask,
+            progress_callback=progress_callback,
+            heartbeat_callback=heartbeat_callback,
+        )
+        channel_mask = _trim_edge_following_channels(
+            channel_mask,
+            direction_array,
+            edge_contact_mask,
+            progress_callback=progress_callback,
+            heartbeat_callback=heartbeat_callback,
+        )
+
+    if channel_length_threshold > 1:
+        filtered_channel_mask = _filter_small_components(
+            channel_mask.astype(bool, copy=False),
+            keep_value=True,
+            min_component_size=channel_length_threshold,
+            progress_callback=progress_callback,
+            heartbeat_callback=heartbeat_callback,
+            heartbeat_label="河道长度过滤",
+        )
+        channel_mask = filtered_channel_mask.astype(np.uint8, copy=False)
+        if progress_callback is not None:
+            progress_callback(
+                f"河道长度过滤：已移除长度小于 {channel_length_threshold} 像素的短河道。"
+            )
 
     return channel_mask
 

@@ -33,6 +33,7 @@ export const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   },
   channel_extract: {
     accumulation_threshold: 200,
+    channel_length_threshold: 1,
   },
   save_intermediates: true,
   total_tiles: 72,

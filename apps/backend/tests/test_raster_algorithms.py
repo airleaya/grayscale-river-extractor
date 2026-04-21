@@ -25,7 +25,9 @@ from app.raster_algorithms import (
     _filter_small_components,
     _label_connected_components_python,
     _scale_component_threshold,
+    build_channel_mask,
     compute_d8_flow_directions,
+    compute_flow_accumulation,
     fill_local_sinks,
     generate_auto_mask,
 )
@@ -220,6 +222,96 @@ class RasterAlgorithmTests(unittest.TestCase):
         self.assertEqual(iterations, 1)
         self.assertAlmostEqual(float(repaired[1, 1]), 8.5, places=5)
 
+    def test_channel_extraction_prunes_short_components_by_length_threshold(self) -> None:
+        """Short channel fragments should be removed from the final channel mask."""
+
+        accumulation = np.asarray(
+            (
+                (0.0, 8.0, 8.0, 0.0),
+                (0.0, 8.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 9.0),
+                (0.0, 0.0, 0.0, 0.0),
+            ),
+            dtype=np.float32,
+        )
+
+        channel_mask = build_channel_mask(
+            accumulation,
+            threshold=7.0,
+            channel_length_threshold=2,
+        )
+
+        expected = np.asarray(
+            (
+                (0, 1, 1, 0),
+                (0, 1, 0, 0),
+                (0, 0, 0, 0),
+                (0, 0, 0, 0),
+            ),
+            dtype=np.uint8,
+        )
+        np.testing.assert_array_equal(channel_mask, expected)
+
+    def test_channel_extraction_stops_at_image_edge_instead_of_walking_along_it(self) -> None:
+        """Only the first edge-touching channel pixel should remain after edge-stop trimming."""
+
+        accumulation = np.zeros((5, 5), dtype=np.float32)
+        accumulation[2, 1] = 10.0
+        accumulation[1, 1] = 10.0
+        accumulation[0, 1] = 10.0
+        accumulation[0, 2] = 10.0
+        accumulation[0, 3] = 10.0
+
+        direction = np.full((5, 5), -1, dtype=np.int16)
+        direction[2, 1] = 0
+        direction[1, 1] = 0
+        direction[0, 1] = 2
+        direction[0, 2] = 2
+        direction[0, 3] = 2
+
+        channel_mask = build_channel_mask(
+            accumulation,
+            threshold=5.0,
+            valid_mask=np.ones((5, 5), dtype=bool),
+            direction_array=direction,
+        )
+
+        self.assertEqual(int(channel_mask[2, 1]), 1)
+        self.assertEqual(int(channel_mask[1, 1]), 1)
+        self.assertEqual(int(channel_mask[0, 1]), 1)
+        self.assertEqual(int(channel_mask[0, 2]), 0)
+        self.assertEqual(int(channel_mask[0, 3]), 0)
+
+    def test_channel_extraction_stops_at_mask_edge_instead_of_following_it(self) -> None:
+        """Only the first mask-edge contact should remain when a channel reaches the mask boundary."""
+
+        accumulation = np.zeros((5, 5), dtype=np.float32)
+        accumulation[2, 2] = 10.0
+        accumulation[2, 1] = 10.0
+        accumulation[3, 1] = 10.0
+        accumulation[4, 1] = 10.0
+
+        valid_mask = np.ones((5, 5), dtype=bool)
+        valid_mask[:, 0] = False
+
+        direction = np.full((5, 5), -1, dtype=np.int16)
+        direction[2, 2] = 6
+        direction[2, 1] = 4
+        direction[3, 1] = 4
+        direction[4, 1] = -1
+
+        channel_mask = build_channel_mask(
+            accumulation,
+            threshold=5.0,
+            valid_mask=valid_mask,
+            direction_array=direction,
+        )
+
+        self.assertEqual(int(channel_mask[2, 2]), 1)
+        self.assertEqual(int(channel_mask[2, 1]), 1)
+        self.assertEqual(int(channel_mask[3, 1]), 0)
+        self.assertEqual(int(channel_mask[4, 1]), 0)
+
     def test_deep_basin_keeps_no_unresolved_black_dots_after_flow_direction_fallback(self) -> None:
         """Residual sink cells should receive fallback directions instead of staying black."""
 
@@ -241,6 +333,41 @@ class RasterAlgorithmTests(unittest.TestCase):
         direction = compute_d8_flow_directions(repaired, valid_mask=valid_mask, use_rust_kernel=False)
 
         self.assertTrue(np.all(direction >= 0))
+
+    def test_residual_fallback_breaks_two_cell_backflow_cycle(self) -> None:
+        """Residual repair should not close a 2-cycle when one neighbor already flows into the sink."""
+
+        terrain = np.asarray(
+            (
+                (5.0, 4.0, 5.0),
+                (4.0, 1.0, 2.0),
+                (5.0, 4.0, 5.0),
+            ),
+            dtype=np.float32,
+        )
+        valid_mask = np.ones_like(terrain, dtype=bool)
+
+        direction = compute_d8_flow_directions(terrain, valid_mask=valid_mask, use_rust_kernel=False)
+        accumulation = compute_flow_accumulation(direction)
+
+        self.assertTrue(np.all(direction >= 0))
+        self.assertNotEqual((int(direction[1, 1]), int(direction[1, 2])), (2, 6))
+        self.assertGreater(float(accumulation[1, 1]), 1.0)
+
+    def test_flow_accumulation_rejects_cyclic_direction_graph(self) -> None:
+        """Accumulation should fail loudly when given a cyclic flow graph."""
+
+        direction = np.asarray(
+            (
+                (-1, -1, -1),
+                (-1, 2, 6),
+                (-1, -1, -1),
+            ),
+            dtype=np.int8,
+        )
+
+        with self.assertRaisesRegex(ValueError, "流向环路"):
+            compute_flow_accumulation(direction)
 
     def test_auto_mask_component_filter_emits_heartbeat_inside_large_component_scan(self) -> None:
         """Large connected-component scans should keep reporting liveness from the BFS loop."""

@@ -1,4 +1,4 @@
-export type TaskStatus = 'queued' | 'running' | 'completed' | 'failed' | 'canceled'
+export type TaskStatus = 'draft' | 'queued' | 'running' | 'pausing' | 'paused' | 'completed' | 'failed' | 'canceled'
 
 export type PipelineStage =
   | 'io'
@@ -75,9 +75,21 @@ export type PipelineConfig = {
   }
   channel_extract: {
     accumulation_threshold: number
+    channel_length_threshold: number
   }
   save_intermediates: boolean
   total_tiles: number
+}
+
+export type UploadedFileKind = 'input' | 'mask'
+
+export type DraftTaskState = {
+  input_path?: string | null
+  mask_path?: string | null
+  output_path: string
+  config: PipelineConfig
+  inherit_intermediates: boolean
+  inherit_stage_outputs?: PipelineStage[] | null
 }
 
 export type CreateTaskRequest = {
@@ -85,21 +97,55 @@ export type CreateTaskRequest = {
   mask_path?: string | null
   output_path: string
   config: PipelineConfig
+  start_stage?: PipelineStage | null
+  end_stage?: PipelineStage | null
+  inherit_intermediates?: boolean
+  inherit_stage_outputs?: PipelineStage[] | null
+}
+
+export type ContinueTaskRequest = {
+  end_stage?: PipelineStage | null
+  inherit_intermediates?: boolean
+  inherit_stage_outputs?: PipelineStage[] | null
 }
 
 export type UploadedFileInfo = {
+  kind: UploadedFileKind
   filename: string
   stored_path: string
   size_bytes: number
 }
 
+export type CreateDraftTaskRequest = {
+  name?: string | null
+}
+
+export type RenameTaskRequest = {
+  name: string
+}
+
+export type RenameUploadedFileRequest = {
+  kind: UploadedFileKind
+  stored_path: string
+  name: string
+}
+
+export type DeleteUploadedFileRequest = {
+  kind: UploadedFileKind
+  stored_path: string
+}
+
 export type TaskSnapshot = {
   task_id: string
+  name: string
   status: TaskStatus
+  draft_state: DraftTaskState | null
   progress: TaskProgress
   created_at: string
   updated_at: string
   result: PipelineResult | null
   error: string | null
   recent_logs: string[]
+  last_completed_stage: PipelineStage | null
+  completed_stages: PipelineStage[]
 }

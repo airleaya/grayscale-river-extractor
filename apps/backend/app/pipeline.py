@@ -24,10 +24,12 @@ from .logging_utils import get_logger
 from .models import (
     ArtifactRecord,
     ArtifactStatus,
+    PIPELINE_STAGE_SEQUENCE,
     PipelineConfig,
     PipelineResult,
     PipelineStage,
     RiverTaskRequest,
+    get_stage_index,
 )
 from .raster_algorithms import (
     accumulation_preview_image,
@@ -54,6 +56,7 @@ pipeline_logger = get_logger("river.pipeline")
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 ARTIFACT_LABELS = {
     "input_preview": "输入图像",
+    "user_mask": "用户遮罩",
     "auto_mask": "自动遮罩",
     "terrain_preprocessed": "预处理地形",
     "flow_direction": "流向",
@@ -130,6 +133,11 @@ def build_default_pipeline_result(context: PipelineContext) -> PipelineResult:
         "terrain_preprocessed": ArtifactRecord(
             key="terrain_preprocessed",
             label=ARTIFACT_LABELS["terrain_preprocessed"],
+            stage=PipelineStage.PREPROCESS,
+        ),
+        "user_mask": ArtifactRecord(
+            key="user_mask",
+            label=ARTIFACT_LABELS["user_mask"],
             stage=PipelineStage.PREPROCESS,
         ),
         "auto_mask": ArtifactRecord(
@@ -576,6 +584,22 @@ class PreprocessStageRunner:
             )
 
         merged_mask = valid_mask & user_mask
+        user_mask_preview_path = context.task_directory / "user_mask.png"
+        user_mask_data_path = context.task_directory / "user_mask.npy"
+        np.save(user_mask_data_path, user_mask.astype(np.uint8))
+        auto_mask_preview_image(user_mask).save(user_mask_preview_path)
+        reporter.publish_artifact(
+            ArtifactRecord(
+                key="user_mask",
+                label=get_artifact_label("user_mask"),
+                stage=self.stage,
+                status=ArtifactStatus.READY,
+                path=to_project_relative_path(user_mask_data_path),
+                preview_path=to_project_relative_path(user_mask_preview_path),
+                width=int(user_mask.shape[1]),
+                height=int(user_mask.shape[0]),
+            )
+        )
         reporter.advance(
             1,
             f"已应用用户遮罩 {context.mask_path.name}；有效像素 {int(merged_mask.sum())}。",
@@ -609,10 +633,11 @@ class FlowDirectionStageRunner:
         total_rows = int(terrain.shape[0])
         total_nodes = int(terrain.shape[0] * terrain.shape[1])
         residual_units = max(8, min(64, total_nodes))
+        cycle_units = max(4, min(32, total_nodes))
         reporter.begin_stage(
             self.stage,
-            total_rows * 2 + residual_units,
-            "Computing D8 flow directions: 1/3 strict downhill, 2/3 flat routing, 3/3 fallback repair.",
+            total_rows * 2 + residual_units + cycle_units,
+            "Computing D8 flow directions: 1/4 strict downhill, 2/4 flat routing, 3/4 fallback repair, 4/4 cycle cleanup.",
         )
         direction_array = compute_d8_flow_directions(
             terrain,
@@ -630,6 +655,8 @@ class FlowDirectionStageRunner:
             strict_heartbeat_callback=build_heartbeat_callback(reporter),
             flat_heartbeat_callback=build_heartbeat_callback(reporter),
             residual_heartbeat_callback=build_heartbeat_callback(reporter),
+            cycle_progress_callback=build_row_progress_callback(reporter, cycle_units),
+            cycle_heartbeat_callback=build_heartbeat_callback(reporter),
         )
 
         preview_image = direction_preview_image(direction_array)
@@ -719,6 +746,7 @@ class ChannelExtractStageRunner:
     ) -> ArtifactRecord:
         accumulation_path = context.task_directory / "flow_accumulation.npy"
         valid_mask_path = context.task_directory / "valid_mask.npy"
+        direction_path = context.task_directory / "flow_direction.npy"
         preview_path = context.task_directory / "channel_mask.png"
         raw_output_path = context.task_directory / "channel_mask.npy"
 
@@ -726,20 +754,31 @@ class ChannelExtractStageRunner:
             raise FileNotFoundError(f"Flow accumulation raster was not found: {accumulation_path}")
         if not valid_mask_path.exists():
             raise FileNotFoundError(f"Preprocessed valid mask was not found: {valid_mask_path}")
+        if not direction_path.exists():
+            raise FileNotFoundError(f"Flow direction raster was not found: {direction_path}")
 
         accumulation = np.load(accumulation_path).astype(np.float32)
         valid_mask = np.load(valid_mask_path).astype(bool)
+        direction_array = np.load(direction_path).astype(np.int16)
         threshold = float(config.channel_extract.accumulation_threshold)
+        channel_length_threshold = int(config.channel_extract.channel_length_threshold)
+        stage_units = int(accumulation.shape[0]) * 4 + 32
         reporter.begin_stage(
             self.stage,
-            int(accumulation.shape[0]),
-            f"Extracting channels with accumulation threshold {threshold:.2f}.",
+            stage_units,
+            (
+                "Extracting channels with accumulation threshold "
+                f"{threshold:.2f}, trimming edge-following segments, and pruning channels shorter than "
+                f"{channel_length_threshold} pixels."
+            ),
         )
         channel_mask = build_channel_mask(
             accumulation,
             threshold,
             valid_mask=valid_mask,
-            progress_callback=build_row_progress_callback(reporter, int(accumulation.shape[0])),
+            direction_array=direction_array,
+            channel_length_threshold=channel_length_threshold,
+            progress_callback=build_row_progress_callback(reporter, stage_units),
             heartbeat_callback=build_heartbeat_callback(reporter),
         )
 
@@ -777,27 +816,55 @@ class RiverPipeline:
             ChannelExtractStageRunner(),
         )
 
-    def run(self, task_id: str, request: RiverTaskRequest, reporter: ProgressReporter) -> PipelineResult:
+    def run(
+        self,
+        task_id: str,
+        request: RiverTaskRequest,
+        reporter: ProgressReporter,
+        existing_result: PipelineResult | None = None,
+    ) -> PipelineResult:
         """Execute the pipeline and return the explicit artifact registry."""
 
         context = build_pipeline_context(task_id, request)
         config = request.config
-        result = build_default_pipeline_result(context)
+        result = (
+            existing_result.model_copy(deep=True)
+            if existing_result is not None
+            else build_default_pipeline_result(context)
+        )
         write_pipeline_metadata(result, context.metadata_path)
+        start_stage = request.start_stage or PIPELINE_STAGE_SEQUENCE[0]
+        end_stage = request.end_stage or PIPELINE_STAGE_SEQUENCE[-1]
+        start_index = get_stage_index(start_stage)
+        end_index = get_stage_index(end_stage)
         pipeline_logger.info(
-            "Pipeline run started for task_id='%s' input='%s' output='%s' total_tiles=%s.",
+            (
+                "Pipeline run started for task_id='%s' input='%s' output='%s' "
+                "total_tiles=%s start_stage=%s end_stage=%s."
+            ),
             task_id,
             context.input_path,
             context.output_path,
             config.total_tiles,
+            start_stage.value,
+            end_stage.value,
         )
-        for stage_runner in self._stages:
+        for stage_index, stage_runner in enumerate(self._stages):
             if reporter.is_canceled():
                 pipeline_logger.warning("Pipeline run interrupted because the task was canceled.")
                 break
 
+            if stage_index < start_index:
+                reporter.log(f"继承已有阶段产物，跳过 {stage_runner.stage.value}。")
+                continue
+            if stage_index > end_index:
+                break
+
             artifact = stage_runner.run(context, config, reporter)
             result = update_result_with_artifact(result, artifact, context.metadata_path)
+            if stage_index == end_index:
+                reporter.log(f"任务已按请求在 {stage_runner.stage.value} 阶段结束。")
+                break
 
         pipeline_logger.info("Pipeline run completed with artifacts: %s", result.artifacts)
         return result

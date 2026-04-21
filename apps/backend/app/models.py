@@ -22,11 +22,20 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def default_task_name() -> str:
+    """Return a stable fallback display name for new task records."""
+
+    return f"Task {utc_now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+
 class TaskStatus(str, Enum):
     """Stable task lifecycle states exposed to the frontend."""
 
+    DRAFT = "draft"
     QUEUED = "queued"
     RUNNING = "running"
+    PAUSING = "pausing"
+    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELED = "canceled"
@@ -40,6 +49,31 @@ class PipelineStage(str, Enum):
     FLOW_DIRECTION = "flow_direction"
     FLOW_ACCUMULATION = "flow_accumulation"
     CHANNEL_EXTRACT = "channel_extract"
+
+
+PIPELINE_STAGE_SEQUENCE: tuple[PipelineStage, ...] = (
+    PipelineStage.IO,
+    PipelineStage.PREPROCESS,
+    PipelineStage.FLOW_DIRECTION,
+    PipelineStage.FLOW_ACCUMULATION,
+    PipelineStage.CHANNEL_EXTRACT,
+)
+
+
+def get_stage_index(stage: PipelineStage) -> int:
+    """Return the stable execution index for a pipeline stage."""
+
+    return PIPELINE_STAGE_SEQUENCE.index(stage)
+
+
+def get_next_stage(stage: PipelineStage) -> PipelineStage | None:
+    """Return the next stage in execution order, if one exists."""
+
+    stage_index = get_stage_index(stage)
+    if stage_index >= len(PIPELINE_STAGE_SEQUENCE) - 1:
+        return None
+
+    return PIPELINE_STAGE_SEQUENCE[stage_index + 1]
 
 
 class PreprocessConfig(BaseModel):
@@ -86,6 +120,7 @@ class ChannelExtractConfig(BaseModel):
     """Configuration for converting accumulation into a binary channel mask."""
 
     accumulation_threshold: float = Field(default=200.0, gt=0)
+    channel_length_threshold: int = Field(default=1, ge=1)
 
 
 class PipelineConfig(BaseModel):
@@ -117,6 +152,72 @@ class RiverTaskRequest(BaseModel):
     mask_path: str | None = None
     output_path: str = Field(min_length=1)
     config: PipelineConfig = Field(default_factory=PipelineConfig)
+    start_stage: PipelineStage | None = None
+    end_stage: PipelineStage | None = None
+    inherit_intermediates: bool = True
+    inherit_stage_outputs: list[PipelineStage] | None = None
+
+
+class DraftTaskState(BaseModel):
+    """Persisted editable state for one task draft before execution starts."""
+
+    input_path: str | None = None
+    mask_path: str | None = None
+    output_path: str = Field(default="data/output/example-channel-result.png", min_length=1)
+    config: PipelineConfig = Field(default_factory=PipelineConfig)
+    inherit_intermediates: bool = True
+    inherit_stage_outputs: list[PipelineStage] | None = None
+
+
+class DraftTaskRequest(BaseModel):
+    """Request payload for creating one editable task draft."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+
+
+class RenameTaskRequest(BaseModel):
+    """Request payload for renaming one persisted task record."""
+
+    name: str = Field(min_length=1, max_length=120)
+
+
+class UploadedFileKind(str, Enum):
+    """Stable file categories used by the asset manager."""
+
+    INPUT = "input"
+    MASK = "mask"
+
+
+class UploadedFileInfo(BaseModel):
+    """Metadata returned for one reusable uploaded file."""
+
+    kind: UploadedFileKind
+    filename: str
+    stored_path: str
+    size_bytes: int
+
+
+class RenameUploadedFileRequest(BaseModel):
+    """Rename one managed uploaded file."""
+
+    kind: UploadedFileKind
+    stored_path: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=240)
+
+
+class DeleteUploadedFileRequest(BaseModel):
+    """Delete one managed uploaded file."""
+
+    kind: UploadedFileKind
+    stored_path: str = Field(min_length=1)
+
+
+class ContinueTaskRequest(BaseModel):
+    """Request payload for continuing one existing task to a target stage."""
+
+    end_stage: PipelineStage | None = None
+    inherit_intermediates: bool = True
+    inherit_stage_outputs: list[PipelineStage] | None = None
 
 
 class TaskProgress(BaseModel):
@@ -186,13 +287,17 @@ class RiverTaskSnapshot(BaseModel):
     """Serializable snapshot returned by the task API."""
 
     task_id: str
+    name: str
     status: TaskStatus
+    draft_state: DraftTaskState | None = None
     progress: TaskProgress
     created_at: datetime
     updated_at: datetime
     result: PipelineResult | None = None
     error: str | None = None
     recent_logs: list[str] = Field(default_factory=list)
+    last_completed_stage: PipelineStage | None = None
+    completed_stages: list[PipelineStage] = Field(default_factory=list)
 
 
 class RiverTaskRecord(BaseModel):
@@ -204,8 +309,10 @@ class RiverTaskRecord(BaseModel):
     """
 
     task_id: str = Field(default_factory=lambda: uuid4().hex)
-    request: RiverTaskRequest
-    status: TaskStatus = TaskStatus.QUEUED
+    name: str = Field(default_factory=default_task_name)
+    draft_state: DraftTaskState | None = Field(default_factory=DraftTaskState)
+    request: RiverTaskRequest | None = None
+    status: TaskStatus = TaskStatus.DRAFT
     progress: TaskProgress = Field(
         default_factory=lambda: TaskProgress(stage=PipelineStage.IO, total_units=1)
     )
@@ -214,3 +321,5 @@ class RiverTaskRecord(BaseModel):
     result: PipelineResult | None = None
     error: str | None = None
     recent_logs: list[str] = Field(default_factory=list)
+    last_completed_stage: PipelineStage | None = None
+    completed_stages: list[PipelineStage] = Field(default_factory=list)
