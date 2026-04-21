@@ -5,8 +5,10 @@ apps/frontend/node_modules/
 apps/frontend/dist/
 apps/frontend/.vite/
 apps/frontend/.vite-temp/
+apps/frontend/.vite-cache/
 apps/backend/__pycache__/
 apps/backend/app/__pycache__/
+apps/backend/tests/__pycache__/
 apps/backend/logs/
 crates/river-kernel/target/
 crates/river-kernel/dist/
