@@ -106,10 +106,10 @@
 }
 
 .artifact-panel-header {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
   gap: 8px;
-  align-items: center;
+  align-items: start;
+  min-width: 0;
 }
 
 .artifact-title-row {
@@ -126,14 +126,15 @@
 .artifact-inline-note {
   color: var(--muted);
   font-size: 12px;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .artifact-chip-row {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  justify-content: end;
+  justify-content: flex-start;
+  min-width: 0;
 }
 
 .artifact-chip {
@@ -150,15 +151,20 @@
 }
 
 .artifact-tab-list {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(118px, max-content);
   gap: 6px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 4px;
+  align-items: stretch;
 }
 
 .artifact-tab {
   display: grid;
   gap: 2px;
-  min-width: 98px;
+  min-width: 118px;
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 7px 9px;
@@ -169,6 +175,12 @@
     transform 0.2s ease,
     border-color 0.2s ease,
     background 0.2s ease;
+}
+
+.artifact-tab span,
+.artifact-tab small {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .artifact-tab small {
@@ -211,6 +223,11 @@
 .artifact-preview-layout {
   display: grid;
   gap: 10px;
+}
+
+.artifact-view-controls {
+  display: grid;
+  gap: 8px;
 }
 
 .artifact-preview-meta {
@@ -341,6 +358,47 @@
   background: #0f1515;
 }
 
+.transparency-toggle-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.transparency-mode-button {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  padding: 5px 10px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition:
+    background 0.2s ease,
+    border-color 0.2s ease,
+    color 0.2s ease;
+}
+
+.transparency-mode-button.active {
+  background: rgba(46, 110, 87, 0.2);
+  border-color: rgba(95, 161, 125, 0.56);
+  color: var(--text-h);
+}
+
+.overlay-layer-actions {
+  display: grid;
+  gap: 8px;
+}
+
+.overlay-control-label {
+  display: grid;
+  gap: 6px;
+}
+
+.overlay-control-label span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .dense-form-grid {
   display: grid;
   gap: 6px;
@@ -390,12 +448,62 @@
   gap: 10px;
 }
 
+.parameter-toggle-matrix-field {
+  display: grid;
+  gap: 8px;
+}
+
+.parameter-toggle-matrix {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, auto));
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  align-items: stretch;
+}
+
+.parameter-toggle-matrix > * {
+  min-width: 0;
+}
+
+.parameter-toggle-segment {
+  grid-column: span 2;
+  width: auto;
+}
+
+.parameter-toggle-matrix .parameter-toggle-segment {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.parameter-toggle-matrix .segmented-option,
+.parameter-toggle-matrix .state-toggle-button {
+  justify-content: center;
+  padding: 7px 4px;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.parameter-toggle-matrix .segmented-option-label,
+.parameter-toggle-matrix .state-toggle-label {
+  font-size: 12px;
+  letter-spacing: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.parameter-toggle-matrix .segmented-option-state,
+.parameter-toggle-matrix .state-toggle-state {
+  display: none;
+}
+
 .segmented-toggle-pair {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0;
-  padding: 4px;
-  border-radius: 18px;
+  padding: 3px;
+  border-radius: 14px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.015)),
@@ -418,12 +526,14 @@
 }
 
 .segmented-option {
-  display: grid;
-  gap: 3px;
-  min-height: 58px;
-  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 0;
+  padding: 8px 10px;
   border: 0;
-  border-radius: 14px;
+  border-radius: 11px;
   background: transparent;
   box-shadow: none;
   text-align: left;
@@ -460,12 +570,22 @@
   font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.02em;
+  min-width: 0;
 }
 
 .segmented-option-state,
 .state-toggle-state {
   font-size: 11px;
   color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.segmented-option-state {
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .segmented-option.selected .segmented-option-state,
@@ -480,12 +600,21 @@
 }
 
 .state-toggle-button {
-  display: grid;
-  gap: 4px;
-  min-height: 64px;
-  padding: 10px 12px;
-  border-radius: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 0;
+  padding: 8px 10px;
+  border-radius: 12px;
   text-align: left;
+}
+
+.state-toggle-state {
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .state-toggle-button.disabled .state-toggle-state {
@@ -881,6 +1010,15 @@ input[type='file']::file-selector-button {
   .segmented-toggle-pair,
   .state-toggle-grid {
     grid-template-columns: 1fr;
+  }
+
+  .parameter-toggle-matrix {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-rows: none;
+  }
+
+  .parameter-toggle-segment {
+    grid-column: span 3;
   }
 
   .dense-form-grid > .group-header,

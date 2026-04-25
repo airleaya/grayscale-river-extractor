@@ -7,6 +7,28 @@ export type PipelineStage =
   | 'flow_accumulation'
   | 'channel_extract'
 
+export type ParallelChunkStatus = 'pending' | 'running' | 'completed'
+
+export type ParallelChunkProgress = {
+  chunk_id: string
+  label: string
+  status: ParallelChunkStatus
+  processed_units: number
+  total_units: number
+  percent: number
+  detail: string
+}
+
+export type ParallelWorkProgress = {
+  label: string
+  strategy: string
+  processed_units: number
+  total_units: number
+  completed_chunks: number
+  total_chunks: number
+  chunks: ParallelChunkProgress[]
+}
+
 export type TaskProgress = {
   stage: PipelineStage
   percent: number
@@ -16,6 +38,7 @@ export type TaskProgress = {
   eta_seconds: number | null
   last_heartbeat_at: string | null
   last_heartbeat_message: string
+  parallel_work: ParallelWorkProgress | null
 }
 
 export type ArtifactStatus = 'pending' | 'ready'
@@ -52,6 +75,10 @@ export type PipelineConfig = {
     smooth: boolean
     smooth_kernel_size: number
     fill_sinks: boolean
+    fill_sink_algorithm: 'auto' | 'legacy' | 'priority_flood'
+    max_fill_depth: number | null
+    deep_basin_mode: 'fill' | 'preserve' | 'mark'
+    fast_fill_min_pixels: number
     preserve_nodata: boolean
     nodata_value: number | null
     use_auto_mask: boolean
@@ -72,6 +99,7 @@ export type PipelineConfig = {
   }
   flow_accumulation: {
     normalize: boolean
+    use_rust_kernel: boolean
   }
   channel_extract: {
     accumulation_threshold: number
@@ -79,6 +107,7 @@ export type PipelineConfig = {
   }
   save_intermediates: boolean
   total_tiles: number
+  preview_max_side: number
 }
 
 export type UploadedFileKind = 'input' | 'mask'

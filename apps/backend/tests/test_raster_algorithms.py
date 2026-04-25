@@ -28,10 +28,18 @@ from app.raster_algorithms import (
     build_channel_mask,
     compute_d8_flow_directions,
     compute_flow_accumulation,
+    fill_depressions_priority_flood,
     fill_local_sinks,
     generate_auto_mask,
 )
-from app.rust_bridge import compute_strict_d8_rust, label_connected_components_rust, rust_kernel_available
+from app.rust_bridge import (
+    compute_flow_accumulation_rust,
+    compute_strict_d8_rust,
+    label_connected_components_rust,
+    rust_flow_accumulation_available,
+    rust_kernel_available,
+    rust_priority_flood_available,
+)
 
 
 class RasterAlgorithmTests(unittest.TestCase):
@@ -222,6 +230,30 @@ class RasterAlgorithmTests(unittest.TestCase):
         self.assertEqual(iterations, 1)
         self.assertAlmostEqual(float(repaired[1, 1]), 8.5, places=5)
 
+    def test_priority_flood_fills_closed_depression_to_spill_level(self) -> None:
+        """The fast fill path should raise an enclosed basin to its spill level."""
+
+        if not rust_priority_flood_available():
+            self.skipTest("Rust kernel is not installed in the active environment.")
+
+        terrain = np.asarray(
+            (
+                (9.0, 9.0, 9.0, 9.0, 9.0),
+                (9.0, 5.0, 5.0, 5.0, 9.0),
+                (9.0, 5.0, 1.0, 5.0, 9.0),
+                (9.0, 5.0, 5.0, 5.0, 9.0),
+                (9.0, 9.0, 9.0, 9.0, 9.0),
+            ),
+            dtype=np.float32,
+        )
+        valid_mask = np.ones_like(terrain, dtype=bool)
+
+        filled, fill_depth = fill_depressions_priority_flood(terrain, valid_mask)
+
+        self.assertEqual(float(filled[2, 2]), 9.0)
+        self.assertEqual(float(fill_depth[2, 2]), 8.0)
+        self.assertEqual(float(fill_depth[0, 0]), 0.0)
+
     def test_channel_extraction_prunes_short_components_by_length_threshold(self) -> None:
         """Short channel fragments should be removed from the final channel mask."""
 
@@ -368,6 +400,26 @@ class RasterAlgorithmTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "流向环路"):
             compute_flow_accumulation(direction)
+
+    def test_rust_flow_accumulation_matches_python_reference(self) -> None:
+        """Rust topological propagation should match the Python accumulation result."""
+
+        if not rust_flow_accumulation_available():
+            self.skipTest("Rust kernel is not installed in the active environment.")
+
+        direction = np.asarray(
+            (
+                (2, 2, 4),
+                (1, 2, 4),
+                (0, 0, -1),
+            ),
+            dtype=np.int8,
+        )
+
+        python_accumulation = compute_flow_accumulation(direction)
+        rust_accumulation = compute_flow_accumulation_rust(direction)
+
+        np.testing.assert_allclose(rust_accumulation, python_accumulation, atol=1e-6)
 
     def test_auto_mask_component_filter_emits_heartbeat_inside_large_component_scan(self) -> None:
         """Large connected-component scans should keep reporting liveness from the BFS loop."""

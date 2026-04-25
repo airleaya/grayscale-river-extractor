@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { PixelRasterViewer, type PersistedView } from './PixelRasterViewer'
+import {
+  PixelRasterViewer,
+  type PersistedView,
+  type RasterViewerLayer,
+  type BlendMode,
+} from './PixelRasterViewer'
 import type { ArtifactRecord, ArtifactViewerResult } from './types'
 
 const API_BASE_URL = 'http://127.0.0.1:8000'
@@ -8,6 +13,7 @@ const ARTIFACT_LABELS: Record<string, string> = {
   user_mask: '用户遮罩',
   auto_mask: '自动遮罩',
   terrain_preprocessed: '预处理',
+  fill_depth: '填洼深度',
   flow_direction: '流向',
   flow_accumulation: '汇流累积',
   channel_mask: '河道结果',
@@ -17,9 +23,19 @@ const PREFERRED_ORDER = [
   'user_mask',
   'auto_mask',
   'terrain_preprocessed',
+  'fill_depth',
   'flow_direction',
   'flow_accumulation',
   'channel_mask',
+]
+const BLEND_MODE_OPTIONS: ReadonlyArray<{
+  value: BlendMode
+  label: string
+  title: string
+}> = [
+  { value: 'normal', label: '原图', title: '普通叠加' },
+  { value: 'lighten', label: '黑穿', title: '等价于 PS 的变亮，黑色基本不影响下层' },
+  { value: 'darken', label: '白穿', title: '等价于 PS 的变暗，白色基本不影响下层' },
 ]
 const FLOW_DIRECTION_LEGEND = [
   { label: '上', color: 'rgb(54, 116, 181)' },
@@ -47,7 +63,8 @@ function toPreviewUrl(previewPath: string | null): string | null {
     return previewPath
   }
 
-  return `${API_BASE_URL}/${previewPath}`
+  const normalizedPath = previewPath.startsWith('/') ? previewPath : `/${previewPath}`
+  return new URL(normalizedPath, `${API_BASE_URL}/`).toString()
 }
 
 function getArtifactLabel(artifact: ArtifactRecord): string {
@@ -60,6 +77,38 @@ function sortArtifacts(artifacts: Record<string, ArtifactRecord>): ArtifactRecor
     const rightIndex = PREFERRED_ORDER.indexOf(right.key)
     return leftIndex - rightIndex
   })
+}
+
+function getDefaultLayerOpacity(key: string): number {
+  switch (key) {
+    case 'input_preview':
+      return 1
+    case 'channel_mask':
+      return 1
+    case 'user_mask':
+      return 0.9
+    case 'auto_mask':
+      return 0.88
+    case 'fill_depth':
+      return 0.62
+    default:
+      return 0.72
+  }
+}
+
+function getDefaultBlendMode(key: string): BlendMode {
+  switch (key) {
+    case 'user_mask':
+    case 'auto_mask':
+    case 'fill_depth':
+      return 'lighten'
+    default:
+      return 'normal'
+  }
+}
+
+function uniqueKeys(keys: string[]): string[] {
+  return [...new Set(keys)]
 }
 
 function FlowDirectionLegend() {
@@ -78,6 +127,30 @@ function FlowDirectionLegend() {
         ))}
       </div>
     </section>
+  )
+}
+
+function BlendModeSelector({
+  value,
+  onChange,
+}: {
+  value: BlendMode
+  onChange: (value: BlendMode) => void
+}) {
+  return (
+    <div className="transparency-toggle-group" role="group" aria-label="图层混合模式">
+      {BLEND_MODE_OPTIONS.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          className={`transparency-mode-button${value === option.value ? ' active' : ''}`}
+          title={option.title}
+          onClick={() => onChange(option.value)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
   )
 }
 
@@ -102,7 +175,10 @@ export function ArtifactViewerTabs({ result }: ArtifactViewerTabsProps) {
   const [persistedView, setPersistedView] = useState<PersistedView | null>(null)
   const [overlayMode, setOverlayMode] = useState(false)
   const [selectedOverlayKeys, setSelectedOverlayKeys] = useState<string[]>([])
+  const [overlayLayerOrder, setOverlayLayerOrder] = useState<string[]>([])
   const [layerOpacityByKey, setLayerOpacityByKey] = useState<Record<string, number>>({})
+  const [layerBlendModeByKey, setLayerBlendModeByKey] = useState<Record<string, BlendMode>>({})
+  const [draggingLayerKey, setDraggingLayerKey] = useState<string | null>(null)
 
   useEffect(() => {
     if (artifactList.length === 0) {
@@ -116,6 +192,32 @@ export function ArtifactViewerTabs({ result }: ArtifactViewerTabsProps) {
   }, [activeKey, artifactList])
 
   useEffect(() => {
+    setLayerOpacityByKey((current) => {
+      let changed = false
+      const next: Record<string, number> = {}
+      for (const artifact of readyArtifacts) {
+        next[artifact.key] = current[artifact.key] ?? getDefaultLayerOpacity(artifact.key)
+        if (current[artifact.key] === undefined) {
+          changed = true
+        }
+      }
+      return changed || Object.keys(current).length !== Object.keys(next).length ? next : current
+    })
+
+    setLayerBlendModeByKey((current) => {
+      let changed = false
+      const next: Record<string, BlendMode> = {}
+      for (const artifact of readyArtifacts) {
+        next[artifact.key] = current[artifact.key] ?? getDefaultBlendMode(artifact.key)
+        if (current[artifact.key] === undefined) {
+          changed = true
+        }
+      }
+      return changed || Object.keys(current).length !== Object.keys(next).length ? next : current
+    })
+  }, [readyArtifacts])
+
+  useEffect(() => {
     if (readyArtifacts.length === 0) {
       setSelectedOverlayKeys([])
       return
@@ -127,16 +229,35 @@ export function ArtifactViewerTabs({ result }: ArtifactViewerTabsProps) {
         return filtered
       }
 
-      const defaultKey = readyArtifacts[readyArtifacts.length - 1]?.key ?? readyArtifacts[0]?.key
-      return defaultKey ? [defaultKey] : []
+      const lastReadyKey = readyArtifacts[readyArtifacts.length - 1]?.key ?? readyArtifacts[0]?.key
+      const inputKey = readyArtifacts.some((artifact) => artifact.key === 'input_preview') ? 'input_preview' : null
+      return uniqueKeys([inputKey, lastReadyKey].filter((key): key is string => key !== null))
+    })
+  }, [readyArtifacts])
+
+  useEffect(() => {
+    const readyKeys = readyArtifacts.map((artifact) => artifact.key)
+    setOverlayLayerOrder((current) => {
+      const filtered = current.filter((key) => readyKeys.includes(key))
+      const missing = readyKeys.filter((key) => !filtered.includes(key))
+      const next = [...filtered, ...missing]
+      return next.length === current.length && next.every((key, index) => key === current[index]) ? current : next
     })
   }, [readyArtifacts])
 
   const activeArtifact =
     artifactList.find((artifact) => artifact.key === activeKey) ?? artifactList[0] ?? null
+  const readyArtifactsByKey = useMemo(
+    () => Object.fromEntries(readyArtifacts.map((artifact) => [artifact.key, artifact])) as Record<string, ArtifactRecord>,
+    [readyArtifacts],
+  )
   const overlayArtifacts = useMemo(
-    () => readyArtifacts.filter((artifact) => selectedOverlayKeys.includes(artifact.key)),
-    [readyArtifacts, selectedOverlayKeys],
+    () =>
+      overlayLayerOrder
+        .filter((key) => selectedOverlayKeys.includes(key))
+        .map((key) => readyArtifactsByKey[key])
+        .filter((artifact): artifact is ArtifactRecord => artifact !== undefined),
+    [overlayLayerOrder, readyArtifactsByKey, selectedOverlayKeys],
   )
 
   const handleViewChange = useCallback((view: PersistedView) => {
@@ -158,6 +279,185 @@ export function ArtifactViewerTabs({ result }: ArtifactViewerTabsProps) {
       ...current,
       [key]: opacity,
     }))
+  }
+
+  function handleBlendModeChange(key: string, mode: BlendMode) {
+    setLayerBlendModeByKey((current) => ({
+      ...current,
+      [key]: mode,
+    }))
+  }
+
+  function moveOverlayLayer(sourceKey: string, targetKey: string) {
+    if (sourceKey === targetKey) {
+      return
+    }
+
+    setOverlayLayerOrder((current) => {
+      const sourceIndex = current.indexOf(sourceKey)
+      const targetIndex = current.indexOf(targetKey)
+      if (sourceIndex === -1 || targetIndex === -1) {
+        return current
+      }
+
+      const next = [...current]
+      const [movedKey] = next.splice(sourceIndex, 1)
+      next.splice(targetIndex, 0, movedKey)
+      return next
+    })
+  }
+
+  function shiftOverlayLayer(key: string, direction: -1 | 1) {
+    setOverlayLayerOrder((current) => {
+      const sourceIndex = current.indexOf(key)
+      if (sourceIndex === -1) {
+        return current
+      }
+
+      const targetIndex = sourceIndex + direction
+      if (targetIndex < 0 || targetIndex >= current.length) {
+        return current
+      }
+
+      const next = [...current]
+      const [movedKey] = next.splice(sourceIndex, 1)
+      next.splice(targetIndex, 0, movedKey)
+      return next
+    })
+  }
+
+  function buildViewerLayer(artifact: ArtifactRecord): RasterViewerLayer | null {
+    const imageUrl = toPreviewUrl(artifact.preview_path)
+    if (imageUrl === null) {
+      return null
+    }
+
+    return {
+      id: artifact.key,
+      label: getArtifactLabel(artifact),
+      imageUrl,
+      opacity: layerOpacityByKey[artifact.key] ?? getDefaultLayerOpacity(artifact.key),
+      blendMode: layerBlendModeByKey[artifact.key] ?? getDefaultBlendMode(artifact.key),
+    }
+  }
+
+  const activeViewerLayers = useMemo(() => {
+    if (overlayMode) {
+      return overlayArtifacts
+        .map((artifact) => buildViewerLayer(artifact))
+        .filter((layer): layer is RasterViewerLayer => layer !== null)
+    }
+
+    if (activeArtifact === null || activeArtifact.status !== 'ready' || activeArtifact.preview_path === null) {
+      return []
+    }
+
+    const layer = buildViewerLayer(activeArtifact)
+    return layer ? [layer] : []
+  }, [activeArtifact, layerBlendModeByKey, layerOpacityByKey, overlayArtifacts, overlayMode])
+
+  function renderLayerControlCard(
+    artifact: ArtifactRecord,
+    stackIndex: number | null = null,
+    draggable = false,
+  ) {
+    const opacity = layerOpacityByKey[artifact.key] ?? getDefaultLayerOpacity(artifact.key)
+    const blendMode = layerBlendModeByKey[artifact.key] ?? getDefaultBlendMode(artifact.key)
+
+    return (
+      <div
+        key={`control-${artifact.key}`}
+        className={`overlay-layer-card${draggingLayerKey === artifact.key ? ' dragging' : ''}${draggable ? ' sortable' : ''}`}
+        onDragOver={(event) => {
+          if (!draggable || draggingLayerKey === null || draggingLayerKey === artifact.key) {
+            return
+          }
+          event.preventDefault()
+          event.dataTransfer.dropEffect = 'move'
+        }}
+        onDragEnter={(event) => {
+          if (!draggable || draggingLayerKey === null || draggingLayerKey === artifact.key) {
+            return
+          }
+          event.preventDefault()
+          moveOverlayLayer(draggingLayerKey, artifact.key)
+        }}
+        onDrop={(event) => {
+          if (!draggable) {
+            return
+          }
+          event.preventDefault()
+          const sourceKey = event.dataTransfer.getData('text/plain')
+          if (sourceKey) {
+            moveOverlayLayer(sourceKey, artifact.key)
+          }
+          setDraggingLayerKey(null)
+        }}
+        onDragEnd={() => setDraggingLayerKey(null)}
+      >
+        <div className="overlay-layer-header">
+          <strong>{getArtifactLabel(artifact)}</strong>
+          <div className="overlay-layer-meta">
+            <span>
+              {stackIndex === null ? `${Math.round(opacity * 100)}%` : `第 ${stackIndex} 层 · ${Math.round(opacity * 100)}%`}
+            </span>
+            {draggable ? (
+              <>
+                <button
+                  type="button"
+                  className="overlay-layer-order-button"
+                  onClick={() => shiftOverlayLayer(artifact.key, -1)}
+                  title="上移图层"
+                >
+                  上移
+                </button>
+                <button
+                  type="button"
+                  className="overlay-layer-order-button"
+                  onClick={() => shiftOverlayLayer(artifact.key, 1)}
+                  title="下移图层"
+                >
+                  下移
+                </button>
+                <span
+                  className="overlay-layer-drag-hint"
+                  draggable={true}
+                  onDragStart={(event) => {
+                    event.dataTransfer.effectAllowed = 'move'
+                    event.dataTransfer.setData('text/plain', artifact.key)
+                    setDraggingLayerKey(artifact.key)
+                  }}
+                  onDragEnd={() => setDraggingLayerKey(null)}
+                  title="拖动改变图层顺序"
+                >
+                  拖动排序
+                </span>
+              </>
+            ) : null}
+          </div>
+        </div>
+        <div className="overlay-layer-actions">
+          <label className="overlay-control-label">
+            <span>透明度</span>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={Math.round(opacity * 100)}
+              onChange={(event) => handleOpacityChange(artifact.key, Number(event.target.value) / 100)}
+            />
+          </label>
+          <label className="overlay-control-label">
+            <span>混合模式</span>
+            <BlendModeSelector
+              value={blendMode}
+              onChange={(mode) => handleBlendModeChange(artifact.key, mode)}
+            />
+          </label>
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -225,7 +525,7 @@ export function ArtifactViewerTabs({ result }: ArtifactViewerTabsProps) {
                 </div>
                 <div className="metric-card">
                   <span className="field-label">堆叠规则</span>
-                  <strong>输入在底部，最终输出在顶部</strong>
+                  <strong>按右侧图层顺序渲染，越靠下越在上层</strong>
                 </div>
                 <div className="metric-card">
                   <span className="field-label">当前顶层</span>
@@ -234,40 +534,24 @@ export function ArtifactViewerTabs({ result }: ArtifactViewerTabsProps) {
               </div>
 
               <div className="overlay-stage">
-                <div className="overlay-canvas">
-                  {overlayArtifacts.map((artifact) => (
-                    <img
-                      key={artifact.key}
-                      src={toPreviewUrl(artifact.preview_path) ?? ''}
-                      alt={getArtifactLabel(artifact)}
-                      className="overlay-image-layer"
-                      style={{ opacity: layerOpacityByKey[artifact.key] ?? 0.72 }}
-                    />
-                  ))}
+                <div className="artifact-primary-view">
+                  <PixelRasterViewer
+                    layers={activeViewerLayers}
+                    alt="多图层叠图查看"
+                    persistedView={persistedView}
+                    onViewChange={handleViewChange}
+                  />
                 </div>
 
                 <aside className="overlay-control-panel">
                   <div className="thumbnail-header">
-                    <span className="field-label">图层透明度</span>
-                    <p className="muted-copy">默认越靠后的阶段越在上层，最终输出始终在最上层。</p>
+                    <span className="field-label">图层设置</span>
+                    <p className="muted-copy">拖动图层卡片可排序，越靠下的图层越盖在上面；黑穿等价于变亮，白穿等价于变暗。</p>
                   </div>
                   <div className="overlay-layer-list">
-                    {overlayArtifacts.map((artifact) => (
-                      <div key={`opacity-${artifact.key}`} className="overlay-layer-card">
-                        <div className="overlay-layer-header">
-                          <strong>{getArtifactLabel(artifact)}</strong>
-                          <span>{Math.round((layerOpacityByKey[artifact.key] ?? 0.72) * 100)}%</span>
-                        </div>
-                        <input
-                          type="range"
-                          min={0}
-                          max={100}
-                          step={1}
-                          value={Math.round((layerOpacityByKey[artifact.key] ?? 0.72) * 100)}
-                          onChange={(event) => handleOpacityChange(artifact.key, Number(event.target.value) / 100)}
-                        />
-                      </div>
-                    ))}
+                    {overlayArtifacts.map((artifact, index) =>
+                      renderLayerControlCard(artifact, index + 1, true),
+                    )}
                   </div>
                 </aside>
               </div>
@@ -280,6 +564,13 @@ export function ArtifactViewerTabs({ result }: ArtifactViewerTabsProps) {
           </div>
         ) : (
           <div className="artifact-preview-layout">
+            <PixelRasterViewer
+              layers={activeViewerLayers}
+              alt={getArtifactLabel(activeArtifact)}
+              persistedView={persistedView}
+              onViewChange={handleViewChange}
+            />
+
             <div className="artifact-preview-meta">
               <div className="metric-card">
                 <span className="field-label">当前标签</span>
@@ -299,14 +590,11 @@ export function ArtifactViewerTabs({ result }: ArtifactViewerTabsProps) {
               </div>
             </div>
 
-            {activeArtifact.key === 'flow_direction' ? <FlowDirectionLegend /> : null}
+            <div className="artifact-view-controls">
+              {renderLayerControlCard(activeArtifact)}
+            </div>
 
-            <PixelRasterViewer
-              imageUrl={toPreviewUrl(activeArtifact.preview_path) ?? ''}
-              alt={getArtifactLabel(activeArtifact)}
-              persistedView={persistedView}
-              onViewChange={handleViewChange}
-            />
+            {activeArtifact.key === 'flow_direction' ? <FlowDirectionLegend /> : null}
           </div>
         )}
       </div>

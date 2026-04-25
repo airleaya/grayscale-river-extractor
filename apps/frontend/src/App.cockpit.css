@@ -154,8 +154,10 @@
 }
 
 .artifact-panel-header {
-  align-items: center;
+  display: grid;
+  align-items: start;
   gap: 8px;
+  min-width: 0;
 }
 
 .artifact-title-row {
@@ -172,14 +174,15 @@
 .artifact-inline-note {
   color: var(--muted);
   font-size: 12px;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .artifact-chip-row {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  justify-content: end;
+  justify-content: flex-start;
+  min-width: 0;
 }
 
 .artifact-chip {
@@ -221,27 +224,7 @@
   min-height: 0;
   display: grid;
   gap: 8px;
-  grid-template-columns: minmax(0, 1fr) 220px;
-}
-
-.overlay-canvas {
-  position: relative;
-  min-height: 560px;
-  overflow: hidden;
-  border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background:
-    linear-gradient(135deg, rgba(28, 39, 36, 0.92), rgba(10, 16, 18, 0.98)),
-    radial-gradient(circle at top right, rgba(97, 164, 125, 0.18), transparent 38%);
-}
-
-.overlay-image-layer {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  pointer-events: none;
+  grid-template-columns: minmax(0, 1fr) 280px;
 }
 
 .overlay-control-panel {
@@ -268,6 +251,16 @@
   background: rgba(255, 255, 255, 0.03);
 }
 
+.overlay-layer-card.sortable {
+  cursor: default;
+}
+
+.overlay-layer-card.dragging {
+  opacity: 0.56;
+  border-color: rgba(95, 161, 125, 0.66);
+  background: rgba(46, 110, 87, 0.12);
+}
+
 .overlay-layer-header {
   display: flex;
   align-items: center;
@@ -279,6 +272,46 @@
 .overlay-layer-header span {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.overlay-layer-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+}
+
+.overlay-layer-drag-hint {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 3px 8px;
+  border: 1px dashed rgba(95, 161, 125, 0.5);
+  background: rgba(46, 110, 87, 0.12);
+  color: var(--text-h);
+  font-size: 10px;
+  cursor: grab;
+  user-select: none;
+}
+
+.overlay-layer-drag-hint:active {
+  cursor: grabbing;
+}
+
+.overlay-layer-order-button {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.artifact-primary-view {
+  min-height: 0;
+  display: grid;
 }
 
 .artifact-preview-layout,
@@ -578,6 +611,93 @@
   font-size: 12px;
   line-height: 1.35;
   color: var(--text-h);
+  overflow-wrap: anywhere;
+}
+
+.parallel-work-panel {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(95, 161, 125, 0.18);
+  background: rgba(95, 161, 125, 0.06);
+}
+
+.parallel-work-header,
+.parallel-work-summary,
+.parallel-work-card-header,
+.parallel-work-card-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.parallel-work-header,
+.parallel-work-card-header,
+.parallel-work-card-meta,
+.parallel-work-summary {
+  min-width: 0;
+}
+
+.parallel-work-header strong,
+.parallel-work-card-header strong,
+.parallel-work-card-header span,
+.parallel-work-card-meta span,
+.parallel-work-card-meta strong,
+.parallel-work-summary span,
+.parallel-work-summary strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.parallel-work-summary {
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.compact-parallel-track,
+.mini-progress-track {
+  height: 7px;
+}
+
+.parallel-work-grid {
+  display: grid;
+  gap: 6px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.parallel-work-card {
+  display: grid;
+  gap: 6px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.parallel-work-card.pending {
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+.parallel-work-card.running {
+  border-color: rgba(245, 197, 96, 0.32);
+  background: rgba(245, 197, 96, 0.07);
+}
+
+.parallel-work-card.completed {
+  border-color: rgba(95, 161, 125, 0.34);
+  background: rgba(46, 110, 87, 0.12);
+}
+
+.parallel-work-card p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--muted);
   overflow-wrap: anywhere;
 }
 

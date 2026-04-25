@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 type Point = {
   x: number
@@ -24,8 +24,26 @@ type LoadedImage = {
   imageData: Uint8ClampedArray
 }
 
-type PixelRasterViewerProps = {
+type PreparedLayerImage = {
+  id: string
+  label: string
+  opacity: number
+  blendMode: BlendMode
+  image: LoadedImage
+}
+
+export type BlendMode = 'normal' | 'lighten' | 'darken'
+
+export type RasterViewerLayer = {
+  id: string
+  label: string
   imageUrl: string
+  opacity?: number
+  blendMode?: BlendMode
+}
+
+type PixelRasterViewerProps = {
+  layers: RasterViewerLayer[]
   alt: string
   persistedView: PersistedView | null
   onViewChange: (view: PersistedView) => void
@@ -51,7 +69,6 @@ const DISCRETE_SCALES = [1, 2, 4, 8, 16, 32, 64]
 const GRID_SCALE_THRESHOLD = 8
 const PAN_MARGIN = 64
 const THUMBNAIL_SIZE = 180
-
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max)
 }
@@ -73,45 +90,87 @@ function formatRgba(sample: HoverSample | null): string {
   return `${r}, ${g}, ${b}, ${a}`
 }
 
+async function resolveImageSource(source: string): Promise<{ resolvedSource: string; cleanup?: () => void }> {
+  if (
+    source.startsWith('blob:') ||
+    source.startsWith('data:')
+  ) {
+    return { resolvedSource: source }
+  }
+
+  if (source.startsWith('http://') || source.startsWith('https://')) {
+    const response = await fetch(source)
+    if (!response.ok) {
+      throw new Error(`无法加载图像: ${source} (${response.status})`)
+    }
+
+    const blob = await response.blob()
+    const objectUrl = URL.createObjectURL(blob)
+    return {
+      resolvedSource: objectUrl,
+      cleanup: () => URL.revokeObjectURL(objectUrl),
+    }
+  }
+
+  return { resolvedSource: source }
+}
+
 function loadImage(source: string): Promise<LoadedImage> {
   return new Promise((resolve, reject) => {
-    const image = new Image()
-    if (source.startsWith('http://') || source.startsWith('https://')) {
-      image.crossOrigin = 'anonymous'
-    }
-    image.onload = () => {
-      const sourceCanvas = document.createElement('canvas')
-      sourceCanvas.width = image.naturalWidth
-      sourceCanvas.height = image.naturalHeight
+    void (async () => {
+      let cleanup: (() => void) | undefined
 
-      const sourceContext = sourceCanvas.getContext('2d')
-      if (sourceContext === null) {
-        reject(new Error('无法创建图像采样上下文。'))
-        return
-      }
-
-      sourceContext.imageSmoothingEnabled = false
-      sourceContext.drawImage(image, 0, 0)
-      let imageData: Uint8ClampedArray
       try {
-        imageData = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height).data
-      } catch {
-        reject(new Error('图像已加载，但浏览器阻止了像素采样。请检查静态资源跨域配置。'))
-        return
-      }
+        const resolved = await resolveImageSource(source)
+        cleanup = resolved.cleanup
 
-      resolve({
-        width: image.naturalWidth,
-        height: image.naturalHeight,
-        sourceCanvas,
-        sourceContext,
-        imageData,
-      })
-    }
-    image.onerror = () => {
-      reject(new Error(`无法加载图像: ${source}`))
-    }
-    image.src = source
+        const image = new Image()
+        image.decoding = 'async'
+        image.onload = () => {
+          const sourceCanvas = document.createElement('canvas')
+          sourceCanvas.width = image.naturalWidth
+          sourceCanvas.height = image.naturalHeight
+
+          const sourceContext = sourceCanvas.getContext('2d')
+          if (sourceContext === null) {
+            cleanup?.()
+            reject(new Error('无法创建图像采样上下文。'))
+            return
+          }
+
+          sourceContext.imageSmoothingEnabled = false
+          sourceContext.drawImage(image, 0, 0)
+
+          let imageData: Uint8ClampedArray
+          try {
+            imageData = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height).data
+          } catch {
+            cleanup?.()
+            reject(new Error('图像已加载，但浏览器阻止了像素采样。请检查静态资源跨域配置。'))
+            return
+          }
+
+          cleanup?.()
+          resolve({
+            width: image.naturalWidth,
+            height: image.naturalHeight,
+            sourceCanvas,
+            sourceContext,
+            imageData,
+          })
+        }
+
+        image.onerror = () => {
+          cleanup?.()
+          reject(new Error(`无法加载图像: ${source}`))
+        }
+
+        image.src = resolved.resolvedSource
+      } catch (error) {
+        cleanup?.()
+        reject(error instanceof Error ? error : new Error(`无法加载图像: ${source}`))
+      }
+    })()
   })
 }
 
@@ -262,7 +321,26 @@ function sampleRgba(image: LoadedImage, x: number, y: number): [number, number, 
   ]
 }
 
-function renderScaledImage(context: CanvasRenderingContext2D, image: LoadedImage, region: VisibleRegion, scale: number) {
+function sampleRgbaSafe(image: LoadedImage, x: number, y: number): [number, number, number, number] {
+  if (x < 0 || y < 0 || x >= image.width || y >= image.height) {
+    return [0, 0, 0, 0]
+  }
+
+  return sampleRgba(image, x, y)
+}
+
+function renderScaledImage(
+  context: CanvasRenderingContext2D,
+  image: LoadedImage,
+  region: VisibleRegion,
+  scale: number,
+  opacity: number,
+  blendMode: BlendMode,
+) {
+  context.save()
+  context.globalAlpha = opacity
+  context.globalCompositeOperation =
+    blendMode === 'lighten' ? 'lighten' : blendMode === 'darken' ? 'darken' : 'source-over'
   context.imageSmoothingEnabled = true
   context.drawImage(
     image.sourceCanvas,
@@ -275,14 +353,71 @@ function renderScaledImage(context: CanvasRenderingContext2D, image: LoadedImage
     region.sourceWidth * scale,
     region.sourceHeight * scale,
   )
+  context.restore()
 }
 
-function renderPixelBlocks(context: CanvasRenderingContext2D, image: LoadedImage, region: VisibleRegion, scale: number) {
+function blendChannel(backdrop: number, source: number, blendMode: BlendMode): number {
+  if (blendMode === 'lighten') {
+    return Math.max(backdrop, source)
+  }
+
+  if (blendMode === 'darken') {
+    return Math.min(backdrop, source)
+  }
+
+  return source
+}
+
+function compositeLayersAtPixel(layers: PreparedLayerImage[], x: number, y: number): [number, number, number, number] {
+  let red = 0
+  let green = 0
+  let blue = 0
+  let alpha = 0
+
+  for (const layer of layers) {
+    const [sourceRed, sourceGreen, sourceBlue, sourceAlphaByte] = sampleRgbaSafe(layer.image, x, y)
+    const sourceAlpha = (sourceAlphaByte / 255) * layer.opacity
+    if (sourceAlpha <= 0) {
+      continue
+    }
+
+    const compositeRed = (1 - alpha) * sourceRed + alpha * blendChannel(red, sourceRed, layer.blendMode)
+    const compositeGreen = (1 - alpha) * sourceGreen + alpha * blendChannel(green, sourceGreen, layer.blendMode)
+    const compositeBlue = (1 - alpha) * sourceBlue + alpha * blendChannel(blue, sourceBlue, layer.blendMode)
+    const nextAlpha = sourceAlpha + alpha * (1 - sourceAlpha)
+    const nextPremultipliedRed = sourceAlpha * compositeRed + alpha * (1 - sourceAlpha) * red
+    const nextPremultipliedGreen = sourceAlpha * compositeGreen + alpha * (1 - sourceAlpha) * green
+    const nextPremultipliedBlue = sourceAlpha * compositeBlue + alpha * (1 - sourceAlpha) * blue
+
+    red = nextAlpha > 0 ? nextPremultipliedRed / nextAlpha : 0
+    green = nextAlpha > 0 ? nextPremultipliedGreen / nextAlpha : 0
+    blue = nextAlpha > 0 ? nextPremultipliedBlue / nextAlpha : 0
+    alpha = nextAlpha
+  }
+
+  return [
+    Math.round(clamp(red, 0, 255)),
+    Math.round(clamp(green, 0, 255)),
+    Math.round(clamp(blue, 0, 255)),
+    Math.round(clamp(alpha * 255, 0, 255)),
+  ]
+}
+
+function renderPixelBlocks(
+  context: CanvasRenderingContext2D,
+  layers: PreparedLayerImage[],
+  region: VisibleRegion,
+  scale: number,
+) {
   for (let y = 0; y < region.sourceHeight; y += 1) {
     for (let x = 0; x < region.sourceWidth; x += 1) {
       const sourceX = region.sourceX + x
       const sourceY = region.sourceY + y
-      const [r, g, b, a] = sampleRgba(image, sourceX, sourceY)
+      const [r, g, b, a] = compositeLayersAtPixel(layers, sourceX, sourceY)
+      if (a <= 0) {
+        continue
+      }
+
       context.fillStyle = `rgba(${r}, ${g}, ${b}, ${a / 255})`
       context.fillRect(region.drawX + x * scale, region.drawY + y * scale, scale, scale)
     }
@@ -316,15 +451,22 @@ function drawGrid(context: CanvasRenderingContext2D, image: LoadedImage, offset:
   context.restore()
 }
 
-function drawThumbnail(canvas: HTMLCanvasElement, image: LoadedImage, offset: Point, scale: number, viewport: Size) {
+function drawThumbnail(
+  canvas: HTMLCanvasElement,
+  layers: PreparedLayerImage[],
+  primaryImage: LoadedImage,
+  offset: Point,
+  scale: number,
+  viewport: Size,
+) {
   const context = canvas.getContext('2d')
   if (context === null) {
     return
   }
 
-  const fitScale = Math.min(THUMBNAIL_SIZE / image.width, THUMBNAIL_SIZE / image.height)
-  const thumbWidth = Math.max(Math.round(image.width * fitScale), 1)
-  const thumbHeight = Math.max(Math.round(image.height * fitScale), 1)
+  const fitScale = Math.min(THUMBNAIL_SIZE / primaryImage.width, THUMBNAIL_SIZE / primaryImage.height)
+  const thumbWidth = Math.max(Math.round(primaryImage.width * fitScale), 1)
+  const thumbHeight = Math.max(Math.round(primaryImage.height * fitScale), 1)
   const thumbOffset = {
     x: (THUMBNAIL_SIZE - thumbWidth) / 2,
     y: (THUMBNAIL_SIZE - thumbHeight) / 2,
@@ -337,12 +479,18 @@ function drawThumbnail(canvas: HTMLCanvasElement, image: LoadedImage, offset: Po
   context.fillStyle = '#0f1515'
   context.fillRect(0, 0, THUMBNAIL_SIZE, THUMBNAIL_SIZE)
   context.imageSmoothingEnabled = false
-  context.drawImage(image.sourceCanvas, thumbOffset.x, thumbOffset.y, thumbWidth, thumbHeight)
 
-  const visibleLeft = clamp((-offset.x) / scale, 0, image.width)
-  const visibleTop = clamp((-offset.y) / scale, 0, image.height)
-  const visibleWidth = clamp(viewport.width / scale, 0, image.width)
-  const visibleHeight = clamp(viewport.height / scale, 0, image.height)
+  for (const layer of layers) {
+    context.save()
+    context.globalAlpha = layer.opacity
+    context.drawImage(layer.image.sourceCanvas, thumbOffset.x, thumbOffset.y, thumbWidth, thumbHeight)
+    context.restore()
+  }
+
+  const visibleLeft = clamp((-offset.x) / scale, 0, primaryImage.width)
+  const visibleTop = clamp((-offset.y) / scale, 0, primaryImage.height)
+  const visibleWidth = clamp(viewport.width / scale, 0, primaryImage.width)
+  const visibleHeight = clamp(viewport.height / scale, 0, primaryImage.height)
 
   context.strokeStyle = 'rgba(255, 237, 189, 0.92)'
   context.lineWidth = 2
@@ -354,7 +502,7 @@ function drawThumbnail(canvas: HTMLCanvasElement, image: LoadedImage, offset: Po
   )
 }
 
-export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }: PixelRasterViewerProps) {
+export function PixelRasterViewer({ layers, alt, persistedView, onViewChange }: PixelRasterViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const frameRef = useRef<HTMLDivElement | null>(null)
   const thumbnailRef = useRef<HTMLCanvasElement | null>(null)
@@ -362,14 +510,19 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
   const dragOffsetRef = useRef<Point>({ x: 0, y: 0 })
   const hasInitializedViewRef = useRef(false)
 
-  const [loadedImage, setLoadedImage] = useState<LoadedImage | null>(null)
+  const [rawLayerImagesById, setRawLayerImagesById] = useState<Record<string, LoadedImage>>({})
   const [viewport, setViewport] = useState<Size>({ width: 0, height: 0 })
   const [scale, setScale] = useState(1)
   const [offset, setOffset] = useState<Point>({ x: 0, y: 0 })
   const [hoverSample, setHoverSample] = useState<HoverSample | null>(null)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
 
   const scaleMode = useMemo(() => (scale <= 1 ? '连续缩放' : '像素重渲染'), [scale])
+  const loadSignature = useMemo(
+    () => layers.map((layer) => `${layer.id}:${layer.imageUrl}`).join('|'),
+    [layers],
+  )
 
   useEffect(() => {
     const frame = frameRef.current
@@ -402,50 +555,99 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
   useEffect(() => {
     let isActive = true
     hasInitializedViewRef.current = false
-
-    setLoadedImage(null)
-    setErrorMessage(null)
     setHoverSample(null)
+    setErrorMessage(null)
 
-    loadImage(imageUrl)
-      .then((image) => {
+    if (layers.length === 0) {
+      setRawLayerImagesById({})
+      setIsLoading(false)
+      return () => {
+        isActive = false
+      }
+    }
+
+    setIsLoading(true)
+
+    void Promise.all(
+      layers.map(async (layer) => ({
+        id: layer.id,
+        image: await loadImage(layer.imageUrl),
+      })),
+    )
+      .then((loadedLayers) => {
         if (!isActive) {
           return
         }
 
-        setLoadedImage(image)
+        const nextLayerMap = Object.fromEntries(
+          loadedLayers.map((layer) => [layer.id, layer.image]),
+        ) as Record<string, LoadedImage>
+        setRawLayerImagesById(nextLayerMap)
+        setIsLoading(false)
       })
       .catch((error: Error) => {
         if (!isActive) {
           return
         }
 
+        setRawLayerImagesById({})
         setErrorMessage(error.message)
+        setIsLoading(false)
       })
 
     return () => {
       isActive = false
     }
-  }, [imageUrl])
+  }, [loadSignature])
+
+  const preparedLayers = useMemo(
+    () =>
+      layers
+        .map((layer) => {
+          const rawImage = rawLayerImagesById[layer.id]
+          if (!rawImage) {
+            return null
+          }
+
+          return {
+            id: layer.id,
+            label: layer.label,
+            opacity: clamp(layer.opacity ?? 1, 0, 1),
+            blendMode: layer.blendMode ?? 'normal',
+            image: rawImage,
+          } satisfies PreparedLayerImage
+        })
+        .filter((layer): layer is PreparedLayerImage => layer !== null),
+    [layers, rawLayerImagesById],
+  )
+
+  const primaryLayer = preparedLayers[0] ?? null
+  const primaryImage = primaryLayer?.image ?? null
 
   useEffect(() => {
-    if (loadedImage === null || viewport.width === 0 || viewport.height === 0 || hasInitializedViewRef.current) {
+    if (primaryImage === null || viewport.width === 0 || viewport.height === 0 || hasInitializedViewRef.current) {
       return
     }
 
     const fitView =
       persistedView === null
-        ? buildFitView(loadedImage, viewport)
-        : restoreViewFromPersisted(loadedImage, viewport, persistedView)
+        ? buildFitView(primaryImage, viewport)
+        : restoreViewFromPersisted(primaryImage, viewport, persistedView)
     hasInitializedViewRef.current = true
     dragOffsetRef.current = fitView.offset
     setScale(fitView.scale)
     setOffset(fitView.offset)
-  }, [loadedImage, persistedView, viewport])
+  }, [primaryImage, persistedView, viewport])
 
   useEffect(() => {
     const canvas = canvasRef.current
-    if (canvas === null || loadedImage === null || viewport.width === 0 || viewport.height === 0) {
+    if (
+      canvas === null ||
+      primaryImage === null ||
+      preparedLayers.length === 0 ||
+      viewport.width === 0 ||
+      viewport.height === 0
+    ) {
       return
     }
 
@@ -465,27 +667,40 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
     context.fillStyle = '#090d0e'
     context.fillRect(0, 0, viewport.width, viewport.height)
 
-    const region = computeVisibleRegion(loadedImage, offset, scale, viewport)
+    const region = computeVisibleRegion(primaryImage, offset, scale, viewport)
     if (region !== null) {
       if (scale <= 1) {
-        renderScaledImage(context, loadedImage, region, scale)
+        for (const layer of preparedLayers) {
+          const layerRegion = computeVisibleRegion(layer.image, offset, scale, viewport)
+          if (layerRegion === null || layer.opacity <= 0) {
+            continue
+          }
+
+          renderScaledImage(context, layer.image, layerRegion, scale, layer.opacity, layer.blendMode)
+        }
       } else {
-        renderPixelBlocks(context, loadedImage, region, scale)
+        renderPixelBlocks(context, preparedLayers, region, scale)
       }
     }
 
     if (scale >= GRID_SCALE_THRESHOLD) {
-      drawGrid(context, loadedImage, offset, scale, viewport)
+      drawGrid(context, primaryImage, offset, scale, viewport)
     }
-  }, [loadedImage, offset, scale, viewport])
+  }, [offset, preparedLayers, primaryImage, scale, viewport])
 
   useEffect(() => {
-    if (loadedImage === null || thumbnailRef.current === null || viewport.width === 0 || viewport.height === 0) {
+    if (
+      primaryImage === null ||
+      preparedLayers.length === 0 ||
+      thumbnailRef.current === null ||
+      viewport.width === 0 ||
+      viewport.height === 0
+    ) {
       return
     }
 
-    drawThumbnail(thumbnailRef.current, loadedImage, offset, scale, viewport)
-  }, [loadedImage, offset, scale, viewport])
+    drawThumbnail(thumbnailRef.current, preparedLayers, primaryImage, offset, scale, viewport)
+  }, [offset, preparedLayers, primaryImage, scale, viewport])
 
   useEffect(() => {
     const frame = frameRef.current
@@ -504,11 +719,11 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
   }, [])
 
   useEffect(() => {
-    if (loadedImage === null || viewport.width === 0 || viewport.height === 0 || !hasInitializedViewRef.current) {
+    if (primaryImage === null || viewport.width === 0 || viewport.height === 0 || !hasInitializedViewRef.current) {
       return
     }
 
-    const nextOffset = clampOffset({ ...offset }, loadedImage, scale, viewport)
+    const nextOffset = clampOffset({ ...offset }, primaryImage, scale, viewport)
     dragOffsetRef.current = nextOffset
     setOffset((current) => {
       if (current.x === nextOffset.x && current.y === nextOffset.y) {
@@ -516,18 +731,18 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
       }
       return nextOffset
     })
-  }, [loadedImage, viewport.width, viewport.height])
+  }, [primaryImage, scale, viewport.height, viewport.width])
 
   useEffect(() => {
-    if (loadedImage === null || viewport.width === 0 || viewport.height === 0 || !hasInitializedViewRef.current) {
+    if (primaryImage === null || viewport.width === 0 || viewport.height === 0 || !hasInitializedViewRef.current) {
       return
     }
 
-    onViewChange(buildPersistedView(loadedImage, viewport, scale, offset))
-  }, [loadedImage, offset, onViewChange, scale, viewport])
+    onViewChange(buildPersistedView(primaryImage, viewport, scale, offset))
+  }, [offset, onViewChange, primaryImage, scale, viewport])
 
   function handleWheel(event: React.WheelEvent<HTMLCanvasElement>) {
-    if (loadedImage === null || canvasRef.current === null || viewport.width === 0 || viewport.height === 0) {
+    if (primaryImage === null || canvasRef.current === null || viewport.width === 0 || viewport.height === 0) {
       return
     }
 
@@ -542,7 +757,7 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
         x: pointer.x - imageSpaceX * nextScale,
         y: pointer.y - imageSpaceY * nextScale,
       },
-      loadedImage,
+      primaryImage,
       nextScale,
       viewport,
     )
@@ -557,7 +772,13 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
   }
 
   function handleMouseMove(event: React.MouseEvent<HTMLCanvasElement>) {
-    if (loadedImage === null || canvasRef.current === null || viewport.width === 0 || viewport.height === 0) {
+    if (
+      primaryImage === null ||
+      canvasRef.current === null ||
+      viewport.width === 0 ||
+      viewport.height === 0 ||
+      preparedLayers.length === 0
+    ) {
       return
     }
 
@@ -565,11 +786,11 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
     const pixelX = Math.floor((pointer.x - offset.x) / scale)
     const pixelY = Math.floor((pointer.y - offset.y) / scale)
 
-    if (pixelX >= 0 && pixelY >= 0 && pixelX < loadedImage.width && pixelY < loadedImage.height) {
+    if (pixelX >= 0 && pixelY >= 0 && pixelX < primaryImage.width && pixelY < primaryImage.height) {
       setHoverSample({
         x: pixelX,
         y: pixelY,
-        rgba: sampleRgba(loadedImage, pixelX, pixelY),
+        rgba: compositeLayersAtPixel(preparedLayers, pixelX, pixelY),
       })
     } else {
       setHoverSample(null)
@@ -586,7 +807,7 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
         x: dragOffsetRef.current.x + deltaX,
         y: dragOffsetRef.current.y + deltaY,
       },
-      loadedImage,
+      primaryImage,
       scale,
       viewport,
     )
@@ -606,7 +827,7 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
   }
 
   function zoomBy(factor: number) {
-    if (loadedImage === null || viewport.width === 0 || viewport.height === 0) {
+    if (primaryImage === null || viewport.width === 0 || viewport.height === 0) {
       return
     }
 
@@ -627,7 +848,7 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
         x: pointer.x - imageSpaceX * nextScale,
         y: pointer.y - imageSpaceY * nextScale,
       },
-      loadedImage,
+      primaryImage,
       nextScale,
       viewport,
     )
@@ -638,38 +859,38 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
   }
 
   function resetView() {
-    if (loadedImage === null || viewport.width === 0 || viewport.height === 0) {
+    if (primaryImage === null || viewport.width === 0 || viewport.height === 0) {
       return
     }
 
-    const fitView = buildFitView(loadedImage, viewport)
+    const fitView = buildFitView(primaryImage, viewport)
     dragOffsetRef.current = fitView.offset
     setScale(fitView.scale)
     setOffset(fitView.offset)
   }
 
   function handleThumbnailClick(event: React.MouseEvent<HTMLCanvasElement>) {
-    if (loadedImage === null || thumbnailRef.current === null || viewport.width === 0 || viewport.height === 0) {
+    if (primaryImage === null || thumbnailRef.current === null || viewport.width === 0 || viewport.height === 0) {
       return
     }
 
     const point = getCanvasPoint(thumbnailRef.current, event.nativeEvent)
-    const fitScale = Math.min(THUMBNAIL_SIZE / loadedImage.width, THUMBNAIL_SIZE / loadedImage.height)
-    const thumbWidth = loadedImage.width * fitScale
-    const thumbHeight = loadedImage.height * fitScale
+    const fitScale = Math.min(THUMBNAIL_SIZE / primaryImage.width, THUMBNAIL_SIZE / primaryImage.height)
+    const thumbWidth = primaryImage.width * fitScale
+    const thumbHeight = primaryImage.height * fitScale
     const thumbOffset = {
       x: (THUMBNAIL_SIZE - thumbWidth) / 2,
       y: (THUMBNAIL_SIZE - thumbHeight) / 2,
     }
 
-    const imageX = clamp((point.x - thumbOffset.x) / fitScale, 0, loadedImage.width)
-    const imageY = clamp((point.y - thumbOffset.y) / fitScale, 0, loadedImage.height)
+    const imageX = clamp((point.x - thumbOffset.x) / fitScale, 0, primaryImage.width)
+    const imageY = clamp((point.y - thumbOffset.y) / fitScale, 0, primaryImage.height)
     const nextOffset = clampOffset(
       {
         x: viewport.width / 2 - imageX * scale,
         y: viewport.height / 2 - imageY * scale,
       },
-      loadedImage,
+      primaryImage,
       scale,
       viewport,
     )
@@ -695,6 +916,7 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
 
         <div className="pixel-stats">
           <span>模式: {scaleMode}</span>
+          <span>图层: {preparedLayers.length}</span>
           <span>缩放: {scale.toFixed(scale < 1 ? 2 : 0)}x</span>
           <span>区域渲染: 开</span>
           <span>视口: {viewport.width > 0 ? `${viewport.width}×${viewport.height}` : '--'}</span>
@@ -709,6 +931,10 @@ export function PixelRasterViewer({ imageUrl, alt, persistedView, onViewChange }
           {errorMessage ? (
             <div className="artifact-placeholder">
               <p>{errorMessage}</p>
+            </div>
+          ) : isLoading ? (
+            <div className="artifact-placeholder">
+              <p>图像加载中…</p>
             </div>
           ) : (
             <canvas

@@ -24,6 +24,24 @@ def rust_kernel_available() -> bool:
     return river_kernel is not None
 
 
+def rust_priority_flood_available() -> bool:
+    """Return whether the installed Rust extension exposes Priority-Flood."""
+
+    return river_kernel is not None and hasattr(river_kernel, "fill_depressions_priority_flood")
+
+
+def rust_flow_accumulation_available() -> bool:
+    """Return whether the installed Rust extension exposes flow accumulation."""
+
+    return river_kernel is not None and hasattr(river_kernel, "compute_flow_accumulation")
+
+
+def rust_strict_d8_available() -> bool:
+    """Return whether the installed Rust extension exposes strict D8 routing."""
+
+    return river_kernel is not None and hasattr(river_kernel, "compute_strict_d8")
+
+
 def compute_strict_d8_rust(
     height_array: np.ndarray,
     valid_mask: np.ndarray,
@@ -117,6 +135,46 @@ def compute_flat_outlet_drop_map_rust(
             np.asarray(height_array, dtype=np.float32),
             np.asarray(valid_mask, dtype=bool),
             np.asarray(region_labels, dtype=np.int32),
+            progress_callback,
+        ),
+        dtype=np.float32,
+    )
+
+
+def fill_depressions_priority_flood_rust(
+    height_array: np.ndarray,
+    valid_mask: np.ndarray,
+    max_fill_depth: float | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+) -> np.ndarray:
+    """Fill closed depressions using the Rust Priority-Flood kernel."""
+
+    if not rust_priority_flood_available():
+        raise RuntimeError("Rust Priority-Flood kernel is not available in the current Python environment.")
+
+    return np.asarray(
+        river_kernel.fill_depressions_priority_flood(
+            np.asarray(height_array, dtype=np.float32),
+            np.asarray(valid_mask, dtype=bool),
+            max_fill_depth,
+            progress_callback,
+        ),
+        dtype=np.float32,
+    )
+
+
+def compute_flow_accumulation_rust(
+    direction_array: np.ndarray,
+    progress_callback: Callable[[str], None] | None = None,
+) -> np.ndarray:
+    """Compute flow accumulation using the Rust topological propagation kernel."""
+
+    if not rust_flow_accumulation_available():
+        raise RuntimeError("Rust flow-accumulation kernel is not available in the current Python environment.")
+
+    return np.asarray(
+        river_kernel.compute_flow_accumulation(
+            np.asarray(direction_array, dtype=np.int8),
             progress_callback,
         ),
         dtype=np.float32,

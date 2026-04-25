@@ -25,6 +25,7 @@ import type {
   ArtifactViewerResult,
   CreateTaskRequest,
   DraftTaskState,
+  ParallelChunkStatus,
   PipelineConfig,
   PipelineStage,
   TaskSnapshot,
@@ -40,13 +41,14 @@ const ARTIFACT_KEYS = [
   'user_mask',
   'auto_mask',
   'terrain_preprocessed',
+  'fill_depth',
   'flow_direction',
   'flow_accumulation',
   'channel_mask',
 ] as const
 const STEP_ENTRIES: ReadonlyArray<{ key: PipelineStage; title: string; description: string }> = [
-  { key: 'io', title: '输入检查', description: '校验输入栅格、生成输入预览，并建立任务目录。' },
-  { key: 'preprocess', title: '预处理', description: '高低映射、平滑、填洼、自动遮罩与用户遮罩。' },
+  { key: 'io', title: '输入检查', description: '校验输入栅格、尽早加载并应用用户遮罩、生成输入预览，并建立任务目录。' },
+  { key: 'preprocess', title: '预处理', description: '高低映射、平滑、填洼与自动遮罩。' },
   { key: 'flow_direction', title: '流向', description: '计算 D8 流向并修补残余无流向像素。' },
   { key: 'flow_accumulation', title: '汇流', description: '构建汇流依赖图并传播累积结果。' },
   { key: 'channel_extract', title: '河道', description: '提取河道、边缘终止并过滤短河道。' },
@@ -129,6 +131,30 @@ function formatHeartbeatState(status: TaskStatus | null, timestampMs: number | n
   return '可能卡住'
 }
 
+function formatParallelStrategy(strategy: string): string {
+  if (strategy === 'row_tiles') {
+    return '行块并行'
+  }
+
+  if (strategy === 'flat_region_batches') {
+    return '平坡批次并行'
+  }
+
+  return strategy
+}
+
+function formatParallelChunkStatus(status: ParallelChunkStatus): string {
+  if (status === 'completed') {
+    return '已完成'
+  }
+
+  if (status === 'running') {
+    return '计算中'
+  }
+
+  return '等待中'
+}
+
 function normalizeInheritedStageSelection(
   requestedStages: PipelineStage[],
   availableStages: Set<PipelineStage>,
@@ -198,7 +224,7 @@ function buildPreviewResult(
           ? {
               key: 'user_mask',
               label: '用户遮罩',
-              stage: 'preprocess',
+              stage: 'io',
               status: 'ready',
               path: maskPreviewPath,
               preview_path: maskPreviewPath,
@@ -206,9 +232,10 @@ function buildPreviewResult(
               width: null,
               height: null,
             }
-          : buildEmptyArtifact('user_mask', 'preprocess', '用户遮罩'),
+          : buildEmptyArtifact('user_mask', 'io', '用户遮罩'),
       auto_mask: buildEmptyArtifact('auto_mask', 'preprocess', '自动遮罩'),
       terrain_preprocessed: buildEmptyArtifact('terrain_preprocessed', 'preprocess', '预处理'),
+      fill_depth: buildEmptyArtifact('fill_depth', 'preprocess', '填洼深度'),
       flow_direction: buildEmptyArtifact('flow_direction', 'flow_direction', '流向'),
       flow_accumulation: buildEmptyArtifact('flow_accumulation', 'flow_accumulation', '汇流累积'),
       channel_mask: buildEmptyArtifact('channel_mask', 'channel_extract', '河道结果'),
@@ -276,18 +303,20 @@ function GroupHeader({ title, subtitle }: { title: string; subtitle: string }) {
 }
 
 function SegmentedToggleGroup<T extends string>({
+  className,
   value,
   options,
   onChange,
   disabled = false,
 }: {
+  className?: string
   value: T
   options: ReadonlyArray<{ value: T; label: string; title: string }>
   onChange: (value: T) => void
   disabled?: boolean
 }) {
   return (
-    <div className="segmented-toggle-pair" role="radiogroup" aria-label="二选一配置">
+    <div className={`segmented-toggle-pair${className ? ` ${className}` : ''}`} role="radiogroup" aria-label="二选一配置">
       {options.map((option) => {
         const selected = option.value === value
         return (
@@ -488,6 +517,11 @@ export function TaskWorkbenchZh() {
   }, [activeRunningTask, task])
   const leftControlsDisabled = leftLockReason !== null || isSubmitting || isTaskActionPending || isUploadingInput || isUploadingMask
   const progressPercent = task?.progress.percent ?? 0
+  const parallelWork = task?.progress.parallel_work ?? null
+  const parallelProgressPercent =
+    parallelWork !== null && parallelWork.total_units > 0
+      ? Math.min(100, (parallelWork.processed_units / parallelWork.total_units) * 100)
+      : 0
   const lastHeartbeatMessage = task?.progress.last_heartbeat_message || task?.progress.message || '等待第一条心跳。'
   const recentStageEvents = useMemo(() => [...(task?.recent_logs ?? [])].slice(-4).reverse(), [task?.recent_logs])
   const draftSyncLabel = useMemo(() => {
@@ -650,8 +684,11 @@ export function TaskWorkbenchZh() {
       return
     }
 
-    if (task.status === 'draft') {
+    if (task.draft_state !== null) {
       applyDraftStateToForm(task.draft_state)
+    }
+
+    if (task.status === 'draft') {
       setDraftSyncState('saved')
       setDraftSyncError(null)
       setLastDraftSavedAt(parseTimestampMs(task.updated_at) ?? Date.now())
@@ -1335,64 +1372,93 @@ export function TaskWorkbenchZh() {
 
                   <GroupHeader title="预处理" subtitle="高低映射、填洼、自动遮罩与用户遮罩参与方式。" />
 
-                  <div className="field compact-field field-span-2">
-                    <FieldLabel label="高低映射" hint="决定灰度和地形高低的映射关系。" />
-                    <SegmentedToggleGroup
-                      value={pipelineConfig.preprocess.height_mapping}
-                      options={[
-                        { value: 'bright_is_high', label: '亮高', title: '亮像素视为高地形' },
-                        { value: 'dark_is_high', label: '暗高', title: '暗像素视为高地形' },
-                      ]}
-                      onChange={(value) => updatePreprocessConfig((current) => ({ ...current, height_mapping: value }))}
-                      disabled={leftControlsDisabled}
-                    />
-                  </div>
-
-                  <div className="field compact-field">
-                    <FieldLabel label="平滑" hint="轻度平滑输入高程，减少单像素噪声。" />
-                    <ToggleStateButton
-                      label="平滑"
-                      enabled={pipelineConfig.preprocess.smooth}
-                      title="平滑"
-                      onToggle={() => updatePreprocessConfig((current) => ({ ...current, smooth: !current.smooth }))}
-                      disabled={leftControlsDisabled}
-                    />
-                  </div>
-
-                  <div className="field compact-field">
-                    <FieldLabel label="填洼修复" hint="修复封闭洼地和无出口平坡。" />
-                    <ToggleStateButton
-                      label="填洼"
-                      enabled={pipelineConfig.preprocess.fill_sinks}
-                      title="填洼"
-                      onToggle={() => updatePreprocessConfig((current) => ({ ...current, fill_sinks: !current.fill_sinks }))}
-                      disabled={leftControlsDisabled}
-                    />
-                  </div>
-
-                  <div className="field compact-field">
-                    <FieldLabel label="自动遮罩" hint="自动识别有效区并直接参与后续计算。" />
-                    <ToggleStateButton
-                      label="自动遮罩"
-                      enabled={pipelineConfig.preprocess.use_auto_mask}
-                      title="自动遮罩"
-                      onToggle={() =>
-                        updatePreprocessConfig((current) => ({ ...current, use_auto_mask: !current.use_auto_mask }))
-                      }
-                      disabled={leftControlsDisabled}
-                    />
-                  </div>
-
-                  <div className="field compact-field">
-                    <FieldLabel label="用户遮罩" hint="启用后把当前遮罩作为额外约束，只在遮罩允许区域内计算。" />
-                    <ToggleStateButton
-                      label="用户遮罩"
-                      enabled={pipelineConfig.preprocess.use_mask}
-                      title="用户遮罩"
-                      onToggle={() => updatePreprocessConfig((current) => ({ ...current, use_mask: !current.use_mask }))}
-                      disabled={leftControlsDisabled || activeMaskFile === null}
-                      disabledLabel="需先选遮罩"
-                    />
+                  <div className="field compact-field field-span-2 parameter-toggle-matrix-field">
+                    <FieldLabel label="参数开关" hint="常用开关统一放在这里，按两行固定宽度排列，方便快速切换。" />
+                    <div className="parameter-toggle-matrix">
+                      <SegmentedToggleGroup
+                        className="parameter-toggle-segment"
+                        value={pipelineConfig.preprocess.height_mapping}
+                        options={[
+                          { value: 'bright_is_high', label: '亮高', title: '亮像素视为高地形' },
+                          { value: 'dark_is_high', label: '暗高', title: '暗像素视为高地形' },
+                        ]}
+                        onChange={(value) => updatePreprocessConfig((current) => ({ ...current, height_mapping: value }))}
+                        disabled={leftControlsDisabled}
+                      />
+                      <ToggleStateButton
+                        label="平滑"
+                        enabled={pipelineConfig.preprocess.smooth}
+                        title="轻度平滑输入高程，减少单像素噪声。"
+                        onToggle={() => updatePreprocessConfig((current) => ({ ...current, smooth: !current.smooth }))}
+                        disabled={leftControlsDisabled}
+                      />
+                      <ToggleStateButton
+                        label="填洼"
+                        enabled={pipelineConfig.preprocess.fill_sinks}
+                        title="修复封闭洼地和无出口平坡。"
+                        onToggle={() => updatePreprocessConfig((current) => ({ ...current, fill_sinks: !current.fill_sinks }))}
+                        disabled={leftControlsDisabled}
+                      />
+                      <ToggleStateButton
+                        label="自动遮罩"
+                        enabled={pipelineConfig.preprocess.use_auto_mask}
+                        title="自动识别有效区并直接参与后续计算。"
+                        onToggle={() =>
+                          updatePreprocessConfig((current) => ({ ...current, use_auto_mask: !current.use_auto_mask }))
+                        }
+                        disabled={leftControlsDisabled}
+                      />
+                      <ToggleStateButton
+                        label="用户遮罩"
+                        enabled={pipelineConfig.preprocess.use_mask}
+                        title="启用后把当前遮罩作为额外约束，只在遮罩允许区域内计算。"
+                        onToggle={() => updatePreprocessConfig((current) => ({ ...current, use_mask: !current.use_mask }))}
+                        disabled={leftControlsDisabled || activeMaskFile === null}
+                        disabledLabel="需先选遮罩"
+                      />
+                      <ToggleStateButton
+                        label="Rust D8"
+                        enabled={pipelineConfig.flow_direction.use_rust_kernel}
+                        title="启用后优先使用 Rust 严格 D8 内核。"
+                        onToggle={() =>
+                          updateFlowDirectionConfig((current) => ({ ...current, use_rust_kernel: !current.use_rust_kernel }))
+                        }
+                        disabled={leftControlsDisabled}
+                      />
+                      <ToggleStateButton
+                        label="Rust 汇流"
+                        enabled={pipelineConfig.flow_accumulation.use_rust_kernel}
+                        title="启用后优先使用 Rust 拓扑传播内核。"
+                        onToggle={() =>
+                          updateFlowAccumulationConfig((current) => ({ ...current, use_rust_kernel: !current.use_rust_kernel }))
+                        }
+                        disabled={leftControlsDisabled}
+                      />
+                      <ToggleStateButton
+                        label="对数增强"
+                        enabled={pipelineConfig.flow_accumulation.normalize}
+                        title="开启后对汇流预览做对数增强。"
+                        onToggle={() =>
+                          updateFlowAccumulationConfig((current) => ({ ...current, normalize: !current.normalize }))
+                        }
+                        disabled={leftControlsDisabled}
+                      />
+                      <ToggleStateButton
+                        label="中间产物"
+                        enabled={pipelineConfig.save_intermediates}
+                        title="保留每个阶段的中间结果，便于查看和调试。"
+                        onToggle={() => updateRuntimeConfig((current) => ({ ...current, save_intermediates: !current.save_intermediates }))}
+                        disabled={leftControlsDisabled}
+                      />
+                      <ToggleStateButton
+                        label="阶段继承"
+                        enabled={inheritIntermediates}
+                        title="继续运行时是否复用当前任务已完成阶段的产物。"
+                        onToggle={() => setInheritIntermediates((current) => !current)}
+                        disabled={task === null || task.status === 'draft'}
+                        disabledLabel="仅历史任务"
+                      />
+                    </div>
                   </div>
 
                   <div className="field compact-field">
@@ -1426,6 +1492,68 @@ export function TaskWorkbenchZh() {
                         }))
                       }
                       placeholder="留空"
+                    />
+                  </div>
+
+                  <div className="field compact-field">
+                    <FieldLabel label="填洼算法" hint="自动模式会在大图上优先使用 Priority-Flood。" />
+                    <SegmentedToggleGroup
+                      value={pipelineConfig.preprocess.fill_sink_algorithm}
+                      options={[
+                        { value: 'auto', label: '自动', title: '大图优先快速填洼，小图保留兼容路径' },
+                        { value: 'priority_flood', label: '快速', title: '使用 Rust Priority-Flood 全局填洼' },
+                        { value: 'legacy', label: '旧版', title: '使用原有迭代填洼与平坡修补' },
+                      ]}
+                      onChange={(value) => updatePreprocessConfig((current) => ({ ...current, fill_sink_algorithm: value }))}
+                      disabled={leftControlsDisabled}
+                    />
+                  </div>
+
+                  <div className="field compact-field">
+                    <FieldLabel label="深洼策略" hint="标记会保留填深图；保留会把最大填深视为 0。" />
+                    <SegmentedToggleGroup
+                      value={pipelineConfig.preprocess.deep_basin_mode}
+                      options={[
+                        { value: 'mark', label: '标记', title: '正常填洼并输出填深图' },
+                        { value: 'fill', label: '填平', title: '直接按算法填平洼地' },
+                        { value: 'preserve', label: '保留', title: '尽量不抬升深洼地形' },
+                      ]}
+                      onChange={(value) => updatePreprocessConfig((current) => ({ ...current, deep_basin_mode: value }))}
+                      disabled={leftControlsDisabled}
+                    />
+                  </div>
+
+                  <div className="field compact-field">
+                    <FieldLabel label="最大填深" hint="限制快速填洼单像素最大抬升量，留空表示不限制。" />
+                    <input
+                      type="number"
+                      min={0}
+                      max={255}
+                      step={0.5}
+                      value={pipelineConfig.preprocess.max_fill_depth ?? ''}
+                      onChange={(event) =>
+                        updatePreprocessConfig((current) => ({
+                          ...current,
+                          max_fill_depth: event.target.value.trim() === '' ? null : Math.max(0, Number(event.target.value) || 0),
+                        }))
+                      }
+                      placeholder="不限制"
+                    />
+                  </div>
+
+                  <div className="field compact-field">
+                    <FieldLabel label="快速阈值" hint="自动模式下达到该像素数后切换到快速填洼。" />
+                    <input
+                      type="number"
+                      min={1}
+                      step={500000}
+                      value={pipelineConfig.preprocess.fast_fill_min_pixels}
+                      onChange={(event) =>
+                        updatePreprocessConfig((current) => ({
+                          ...current,
+                          fast_fill_min_pixels: Math.max(1, Number(event.target.value) || 1),
+                        }))
+                      }
                     />
                   </div>
 
@@ -1480,19 +1608,6 @@ export function TaskWorkbenchZh() {
                   </div>
 
                   <GroupHeader title="流向与输出" subtitle="调节 D8 权重、汇流预览以及最终河道过滤。" />
-
-                  <div className="field compact-field">
-                    <FieldLabel label="Rust D8" hint="启用后优先使用 Rust 严格 D8 内核。" />
-                    <ToggleStateButton
-                      label="Rust D8"
-                      enabled={pipelineConfig.flow_direction.use_rust_kernel}
-                      title="Rust D8"
-                      onToggle={() =>
-                        updateFlowDirectionConfig((current) => ({ ...current, use_rust_kernel: !current.use_rust_kernel }))
-                      }
-                      disabled={leftControlsDisabled}
-                    />
-                  </div>
 
                   <div className="field compact-field">
                     <FieldLabel label="坡降权重" hint="严格下降时对最陡方向的偏好强度。" />
@@ -1597,19 +1712,6 @@ export function TaskWorkbenchZh() {
                   </div>
 
                   <div className="field compact-field">
-                    <FieldLabel label="汇流预览增强" hint="开启后对汇流预览做对数增强。" />
-                    <ToggleStateButton
-                      label="对数增强"
-                      enabled={pipelineConfig.flow_accumulation.normalize}
-                      title="对数增强"
-                      onToggle={() =>
-                        updateFlowAccumulationConfig((current) => ({ ...current, normalize: !current.normalize }))
-                      }
-                      disabled={leftControlsDisabled}
-                    />
-                  </div>
-
-                  <div className="field compact-field">
                     <FieldLabel label="河道阈值" hint="越低河道越密，越高越偏主干。" />
                     <input
                       type="number"
@@ -1642,29 +1744,6 @@ export function TaskWorkbenchZh() {
                   </div>
 
                   <div className="field compact-field">
-                    <FieldLabel label="保留中间产物" hint="保留每个阶段的中间结果，便于查看和调试。" />
-                    <ToggleStateButton
-                      label="中间产物"
-                      enabled={pipelineConfig.save_intermediates}
-                      title="保留中间产物"
-                      onToggle={() => updateRuntimeConfig((current) => ({ ...current, save_intermediates: !current.save_intermediates }))}
-                      disabled={leftControlsDisabled}
-                    />
-                  </div>
-
-                  <div className="field compact-field">
-                    <FieldLabel label="继承中间产物" hint="继续运行时是否复用当前任务已完成阶段的产物。" />
-                    <ToggleStateButton
-                      label="阶段继承"
-                      enabled={inheritIntermediates}
-                      title="阶段继承"
-                      onToggle={() => setInheritIntermediates((current) => !current)}
-                      disabled={task === null || task.status === 'draft'}
-                      disabledLabel="仅历史任务"
-                    />
-                  </div>
-
-                  <div className="field compact-field">
                     <FieldLabel label="进度分片" hint="任务进度分片数。越大反馈越细。" />
                     <input
                       type="number"
@@ -1675,6 +1754,23 @@ export function TaskWorkbenchZh() {
                         updateRuntimeConfig((current) => ({
                           ...current,
                           total_tiles: Math.max(8, Number(event.target.value) || 8),
+                        }))
+                      }
+                    />
+                  </div>
+
+                  <div className="field compact-field">
+                    <FieldLabel label="预览边长" hint="仅限制阶段预览图，完整计算产物仍保留原尺寸。" />
+                    <input
+                      type="number"
+                      min={512}
+                      max={8192}
+                      step={512}
+                      value={pipelineConfig.preview_max_side}
+                      onChange={(event) =>
+                        updateRuntimeConfig((current) => ({
+                          ...current,
+                          preview_max_side: Math.min(8192, Math.max(512, Number(event.target.value) || 512)),
                         }))
                       }
                     />
@@ -1850,6 +1946,55 @@ export function TaskWorkbenchZh() {
                   <p className="muted-copy">
                     后端快照 <RelativeTimeText timestampMs={backendUpdatedAtMs} />，本地同步 <RelativeTimeText timestampMs={lastBackendSyncAt} />
                   </p>
+                </div>
+
+                <div className="parallel-work-panel">
+                  <div className="parallel-work-header">
+                    <span className="field-label">切块状态</span>
+                    <strong>{parallelWork?.label ?? '当前阶段暂无切块并行任务'}</strong>
+                  </div>
+
+                  {parallelWork !== null ? (
+                    <>
+                      <div className="parallel-work-summary">
+                        <span>{formatParallelStrategy(parallelWork.strategy)}</span>
+                        <span>
+                          {parallelWork.completed_chunks}/{parallelWork.total_chunks} 块完成
+                        </span>
+                        <span>
+                          {parallelWork.processed_units}/{parallelWork.total_units} 单元
+                        </span>
+                        <strong>{parallelProgressPercent.toFixed(1)}%</strong>
+                      </div>
+
+                      <div className="progress-track compact-parallel-track" aria-hidden="true">
+                        <div className="progress-fill" style={{ width: `${parallelProgressPercent}%` }} />
+                      </div>
+
+                      <div className="parallel-work-grid">
+                        {parallelWork.chunks.map((chunk) => (
+                          <div key={chunk.chunk_id} className={`parallel-work-card ${chunk.status}`}>
+                            <div className="parallel-work-card-header">
+                              <strong>{chunk.label}</strong>
+                              <span>{formatParallelChunkStatus(chunk.status)}</span>
+                            </div>
+                            <div className="parallel-work-card-meta">
+                              <span>
+                                {chunk.processed_units}/{chunk.total_units} 单元
+                              </span>
+                              <strong>{chunk.percent.toFixed(1)}%</strong>
+                            </div>
+                            <div className="progress-track mini-progress-track" aria-hidden="true">
+                              <div className="progress-fill" style={{ width: `${chunk.percent}%` }} />
+                            </div>
+                            <p>{chunk.detail || '等待块级状态更新。'}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  ) : (
+                    <p className="muted-copy">当前这一步没有启用切块并发，任务仍会继续通过阶段进度和心跳反馈刷新。</p>
+                  )}
                 </div>
 
                 <div className="stage-event-list">

@@ -10,6 +10,10 @@ export const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
     smooth: true,
     smooth_kernel_size: 3,
     fill_sinks: true,
+    fill_sink_algorithm: 'auto',
+    max_fill_depth: null,
+    deep_basin_mode: 'mark',
+    fast_fill_min_pixels: 8_000_000,
     preserve_nodata: true,
     nodata_value: null,
     use_auto_mask: false,
@@ -30,6 +34,7 @@ export const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   },
   flow_accumulation: {
     normalize: true,
+    use_rust_kernel: true,
   },
   channel_extract: {
     accumulation_threshold: 200,
@@ -37,4 +42,5 @@ export const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   },
   save_intermediates: true,
   total_tiles: 72,
+  preview_max_side: 4096,
 }

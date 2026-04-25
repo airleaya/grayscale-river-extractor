@@ -17,6 +17,9 @@ from .models import (
     ArtifactRecord,
     ArtifactStatus,
     DraftTaskState,
+    ParallelChunkProgress,
+    ParallelChunkStatus,
+    ParallelWorkProgress,
     PIPELINE_STAGE_SEQUENCE,
     PipelineStage,
     RiverTaskRecord,
@@ -89,6 +92,37 @@ class InMemoryProgressReporter(ProgressReporter):
 
         self._last_heartbeat_at = now
         self._task_runner._heartbeat(self._task_id, message)
+
+    def set_parallel_work(
+        self,
+        label: str,
+        strategy: str,
+        chunks: list[tuple[str, str, int]],
+    ) -> None:
+        self._task_runner._checkpoint_task_control(self._task_id)
+        self._task_runner._set_parallel_work(self._task_id, label, strategy, chunks)
+
+    def update_parallel_chunk(
+        self,
+        chunk_id: str,
+        status: str,
+        processed_units: int,
+        total_units: int,
+        detail: str = "",
+    ) -> None:
+        self._task_runner._checkpoint_task_control(self._task_id)
+        self._task_runner._update_parallel_chunk(
+            self._task_id,
+            chunk_id,
+            status,
+            processed_units,
+            total_units,
+            detail,
+        )
+
+    def clear_parallel_work(self) -> None:
+        self._task_runner._checkpoint_task_control(self._task_id)
+        self._task_runner._clear_parallel_work(self._task_id)
 
     def is_canceled(self) -> bool:
         return self._task_runner._is_canceled(self._task_id)
@@ -873,6 +907,7 @@ class InMemoryTaskRunner:
             task.progress.percent = 0.0
             task.progress.message = message
             task.progress.eta_seconds = None
+            task.progress.parallel_work = None
             task.updated_at = utc_now()
             task.progress.last_heartbeat_at = task.updated_at
             task.progress.last_heartbeat_message = message
@@ -950,6 +985,7 @@ class InMemoryTaskRunner:
             task.progress.percent = 100.0
             task.progress.message = message or task.progress.message
             task.progress.eta_seconds = 0.0
+            task.progress.parallel_work = None
             task.updated_at = utc_now()
             task.progress.last_heartbeat_at = task.updated_at
             task.progress.last_heartbeat_message = task.progress.message
@@ -978,6 +1014,104 @@ class InMemoryTaskRunner:
             task.progress.last_heartbeat_message = heartbeat_message
             if heartbeat_message:
                 task.progress.message = heartbeat_message
+            self._persist_task_unlocked(task)
+
+    def _set_parallel_work(
+        self,
+        task_id: str,
+        label: str,
+        strategy: str,
+        chunks: list[tuple[str, str, int]],
+    ) -> None:
+        """Publish one new structured parallel-work snapshot for the current stage."""
+
+        with self._lock:
+            task = self._require_task_unlocked(task_id)
+            normalized_chunks = [
+                ParallelChunkProgress(
+                    chunk_id=chunk_id,
+                    label=chunk_label,
+                    status=ParallelChunkStatus.PENDING,
+                    processed_units=0,
+                    total_units=max(1, total_units),
+                    percent=0.0,
+                    detail="Waiting for a worker.",
+                )
+                for chunk_id, chunk_label, total_units in chunks
+            ]
+            task.progress.parallel_work = ParallelWorkProgress(
+                label=label,
+                strategy=strategy,
+                processed_units=0,
+                total_units=max(1, sum(chunk.total_units for chunk in normalized_chunks)),
+                completed_chunks=0,
+                total_chunks=len(normalized_chunks),
+                chunks=normalized_chunks,
+            )
+            task.updated_at = utc_now()
+            self._persist_task_unlocked(task, force=True)
+
+    def _update_parallel_chunk(
+        self,
+        task_id: str,
+        chunk_id: str,
+        status: str,
+        processed_units: int,
+        total_units: int,
+        detail: str = "",
+    ) -> None:
+        """Update one chunk inside the active structured parallel-work snapshot."""
+
+        with self._lock:
+            task = self._require_task_unlocked(task_id)
+            parallel_work = task.progress.parallel_work
+            if parallel_work is None:
+                return
+
+            target_chunk = next(
+                (chunk for chunk in parallel_work.chunks if chunk.chunk_id == chunk_id),
+                None,
+            )
+            if target_chunk is None:
+                return
+
+            safe_total_units = max(1, total_units)
+            safe_processed_units = min(safe_total_units, max(0, processed_units))
+            target_chunk.status = ParallelChunkStatus(status)
+            target_chunk.total_units = safe_total_units
+            target_chunk.processed_units = safe_processed_units
+            target_chunk.percent = round((safe_processed_units / safe_total_units) * 100.0, 2)
+            target_chunk.detail = detail
+
+            parallel_work.total_units = max(1, sum(chunk.total_units for chunk in parallel_work.chunks))
+            parallel_work.processed_units = min(
+                parallel_work.total_units,
+                sum(chunk.processed_units for chunk in parallel_work.chunks),
+            )
+            parallel_work.completed_chunks = sum(
+                1 for chunk in parallel_work.chunks if chunk.status == ParallelChunkStatus.COMPLETED
+            )
+            parallel_work.total_chunks = len(parallel_work.chunks)
+            task.updated_at = utc_now()
+            self._persist_task_unlocked(
+                task,
+                force=(
+                    target_chunk.status == ParallelChunkStatus.COMPLETED
+                    or safe_processed_units == 0
+                    or safe_processed_units == safe_total_units
+                ),
+            )
+
+    def _clear_parallel_work(self, task_id: str) -> None:
+        """Clear any structured parallel-work snapshot for the active stage."""
+
+        with self._lock:
+            task = self._require_task_unlocked(task_id)
+            if task.progress.parallel_work is None:
+                return
+
+            task.progress.parallel_work = None
+            task.updated_at = utc_now()
             self._persist_task_unlocked(task)
 
     def _checkpoint_task_control(self, task_id: str) -> None:

@@ -8,7 +8,9 @@ stage orchestration so future optimization work can focus on one place.
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from math import ceil
+from os import cpu_count
 from time import monotonic
 from typing import Callable
 
@@ -16,11 +18,16 @@ import numpy as np
 from PIL import Image
 
 from .rust_bridge import (
+    compute_flow_accumulation_rust,
     compute_flat_outlet_drop_map_rust,
     compute_strict_d8_rust,
+    fill_depressions_priority_flood_rust,
     label_connected_components_rust,
     label_equal_height_regions_rust,
+    rust_flow_accumulation_available,
     rust_kernel_available,
+    rust_priority_flood_available,
+    rust_strict_d8_available,
 )
 
 D8_OFFSETS: tuple[tuple[int, int], ...] = (
@@ -37,6 +44,8 @@ D8_DISTANCES = np.asarray(
     (1.0, np.sqrt(2.0), 1.0, np.sqrt(2.0), 1.0, np.sqrt(2.0), 1.0, np.sqrt(2.0)),
     dtype=np.float32,
 )
+D8_ROW_DELTAS = np.asarray([row_delta for row_delta, _ in D8_OFFSETS], dtype=np.int32)
+D8_COLUMN_DELTAS = np.asarray([column_delta for _, column_delta in D8_OFFSETS], dtype=np.int32)
 DIRECTION_PREVIEW_PALETTE = np.asarray(
     (
         (54, 116, 181),
@@ -57,10 +66,17 @@ DEFAULT_CONTINUITY_WEIGHT = 0.3
 DEFAULT_FLAT_OUTLET_LENGTH_WEIGHT = 0.35
 DEFAULT_FLAT_OUTLET_DISTANCE_WEIGHT = 1.5
 ProgressCallback = Callable[[str], None]
+ParallelWorkCallback = Callable[[str, str, list[tuple[str, str, int]]], None]
+ParallelChunkCallback = Callable[[str, str, int, int, str], None]
+ParallelClearCallback = Callable[[], None]
 DEFAULT_FILL_SINK_MAX_ITERATIONS = 32
 AUTO_MASK_MAX_ANALYSIS_SIDE = 1536
 AUTO_MASK_MIN_DOWNSAMPLE_SCALE = 2
 AUTO_MASK_COMPONENT_HEARTBEAT_INTERVAL = 4096
+PARALLEL_TILE_MIN_PIXELS = 1024 * 1024
+MAX_PARALLEL_TILE_WORKERS = max(1, min(4, cpu_count() or 1))
+FLAT_REGION_PARALLEL_MIN_CELLS = 64 * 1024
+MAX_PARALLEL_REGION_WORKERS = max(1, min(4, cpu_count() or 1))
 
 
 def _emit_throttled_heartbeat(
@@ -159,6 +175,95 @@ def _emit_row_progress(
 
     for row_index in range(total_rows):
         progress_callback(message_template.format(index=row_index + 1, total=total_rows))
+
+
+def _choose_parallel_tile_workers(height: int, width: int) -> int:
+    """Choose one conservative worker count for chunkable local raster passes."""
+
+    total_pixels = max(0, int(height) * int(width))
+    if MAX_PARALLEL_TILE_WORKERS <= 1 or total_pixels < PARALLEL_TILE_MIN_PIXELS:
+        return 1
+
+    recommended_workers = max(1, total_pixels // PARALLEL_TILE_MIN_PIXELS)
+    return min(MAX_PARALLEL_TILE_WORKERS, recommended_workers)
+
+
+def _build_row_tiles(height: int, worker_count: int) -> list[tuple[int, int]]:
+    """Split one raster into row tiles with a little over-subscription for load balance."""
+
+    if height <= 0:
+        return []
+
+    target_tile_count = max(1, worker_count * 4)
+    tile_rows = max(32, int(ceil(height / target_tile_count)))
+    return [
+        (start_row, min(start_row + tile_rows, height))
+        for start_row in range(0, height, tile_rows)
+    ]
+
+
+def _emit_tiled_row_progress(
+    progress_callback: ProgressCallback | None,
+    start_row: int,
+    end_row: int,
+    total_rows: int,
+    message_template: str,
+) -> None:
+    """Replay per-row progress after one row tile finishes."""
+
+    if progress_callback is None:
+        return
+
+    for row_index in range(start_row, end_row):
+        progress_callback(message_template.format(index=row_index + 1, total=total_rows))
+
+
+def _build_row_tile_chunk_specs(
+    row_tiles: list[tuple[int, int]],
+    total_rows: int,
+    label_prefix: str = "Rows",
+    chunk_prefix: str = "tile",
+) -> list[tuple[str, str, int]]:
+    """Convert one tile list into a stable set of chunk labels for the UI."""
+
+    return [
+        (
+            f"{chunk_prefix}-{chunk_index + 1}",
+            f"{label_prefix} {start_row + 1}-{end_row}/{total_rows}",
+            max(1, end_row - start_row),
+        )
+        for chunk_index, (start_row, end_row) in enumerate(row_tiles)
+    ]
+
+
+def _publish_parallel_plan(
+    parallel_work_callback: ParallelWorkCallback | None,
+    label: str,
+    strategy: str,
+    chunk_specs: list[tuple[str, str, int]],
+) -> None:
+    """Publish one structured chunk plan when the current algorithm is parallelized."""
+
+    if parallel_work_callback is None or not chunk_specs:
+        return
+
+    parallel_work_callback(label, strategy, chunk_specs)
+
+
+def _update_parallel_chunk(
+    parallel_chunk_callback: ParallelChunkCallback | None,
+    chunk_id: str,
+    status: str,
+    processed_units: int,
+    total_units: int,
+    detail: str,
+) -> None:
+    """Send one structured chunk-progress update if the stage requested it."""
+
+    if parallel_chunk_callback is None:
+        return
+
+    parallel_chunk_callback(chunk_id, status, processed_units, total_units, detail)
 
 
 def _choose_auto_mask_downsample_scale(height: int, width: int) -> int:
@@ -703,6 +808,8 @@ def apply_box_smoothing(
     kernel_size: int,
     progress_callback: ProgressCallback | None = None,
     heartbeat_callback: ProgressCallback | None = None,
+    parallel_work_callback: ParallelWorkCallback | None = None,
+    parallel_chunk_callback: ParallelChunkCallback | None = None,
 ) -> np.ndarray:
     """Apply a small box blur while keeping invalid pixels untouched."""
 
@@ -727,14 +834,15 @@ def apply_box_smoothing(
     smoothed_array = height_array.copy().astype(np.float32)
     kernel_span = radius * 2 + 1
     height, width = height_array.shape
-    next_heartbeat_at = monotonic() + 0.75
+    worker_count = _choose_parallel_tile_workers(height, width)
+    row_tiles = _build_row_tiles(height, worker_count)
+    chunk_specs = _build_row_tile_chunk_specs(row_tiles, height, label_prefix="Rows", chunk_prefix="smooth")
+    left = np.arange(width, dtype=np.int32)[None, :]
+    right = left + kernel_span
 
-    for row_index in range(height):
-        top = row_index
-        bottom = row_index + kernel_span
-        left = np.arange(width, dtype=np.int32)
-        right = left + kernel_span
-
+    def _smooth_tile(start_row: int, end_row: int) -> tuple[int, int, np.ndarray]:
+        top = np.arange(start_row, end_row, dtype=np.int32)[:, None]
+        bottom = top + kernel_span
         window_sum = (
             value_integral[bottom, right]
             - value_integral[top, right]
@@ -747,19 +855,91 @@ def apply_box_smoothing(
             - valid_integral[bottom, left]
             + valid_integral[top, left]
         )
-
         safe_count = np.where(window_count > 0, window_count, 1.0)
-        row_average = window_sum / safe_count
-        row_mask = valid_mask[row_index, :]
-        smoothed_array[row_index, row_mask] = row_average[row_mask]
-        next_heartbeat_at = _emit_throttled_heartbeat(
-            heartbeat_callback,
-            next_heartbeat_at,
-            f"平滑卷积：正在处理第 {row_index + 1}/{height} 行，核大小 {kernel_size}。",
-        )
+        averaged_tile = (window_sum / safe_count).astype(np.float32, copy=False)
+        smoothed_tile = height_array[start_row:end_row, :].copy().astype(np.float32)
+        tile_mask = valid_mask[start_row:end_row, :]
+        smoothed_tile[tile_mask] = averaged_tile[tile_mask]
+        return start_row, end_row, smoothed_tile
 
-        if progress_callback is not None:
-            progress_callback(f"平滑卷积：已完成 {row_index + 1}/{height} 行，核大小 {kernel_size}。")
+    if heartbeat_callback is not None:
+        heartbeat_callback(f"平滑卷积：开始按 {len(row_tiles)} 个行块计算，核大小 {kernel_size}。")
+    _publish_parallel_plan(
+        parallel_work_callback,
+        f"Smoothing kernel {kernel_size}",
+        "row_tiles",
+        chunk_specs,
+    )
+
+    if worker_count <= 1 or len(row_tiles) <= 1:
+        for chunk_index, (start_row, end_row) in enumerate(row_tiles):
+            chunk_id, _, chunk_total = chunk_specs[chunk_index]
+            _update_parallel_chunk(
+                parallel_chunk_callback,
+                chunk_id,
+                "running",
+                0,
+                chunk_total,
+                f"Computing rows {start_row + 1}-{end_row}/{height}.",
+            )
+            _, _, smoothed_tile = _smooth_tile(start_row, end_row)
+            smoothed_array[start_row:end_row, :] = smoothed_tile
+            _emit_tiled_row_progress(
+                progress_callback,
+                start_row,
+                end_row,
+                height,
+                f"平滑卷积：已完成 {{index}}/{{total}} 行，核大小 {kernel_size}。",
+            )
+            _update_parallel_chunk(
+                parallel_chunk_callback,
+                chunk_id,
+                "completed",
+                chunk_total,
+                chunk_total,
+                f"Finished rows {start_row + 1}-{end_row}/{height}.",
+            )
+            if heartbeat_callback is not None:
+                heartbeat_callback(f"平滑卷积：已完成第 {end_row}/{height} 行，核大小 {kernel_size}。")
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="river-smooth") as executor:
+            future_map = {
+                executor.submit(_smooth_tile, start_row, end_row): (chunk_specs[chunk_index], start_row, end_row)
+                for chunk_index, (start_row, end_row) in enumerate(row_tiles)
+            }
+            for chunk_id, _, chunk_total in chunk_specs:
+                _update_parallel_chunk(
+                    parallel_chunk_callback,
+                    chunk_id,
+                    "running",
+                    0,
+                    chunk_total,
+                    "Waiting for worker completion.",
+                )
+            for future in as_completed(future_map):
+                start_row, end_row, smoothed_tile = future.result()
+                chunk_spec, _, _ = future_map[future]
+                chunk_id, _, chunk_total = chunk_spec
+                smoothed_array[start_row:end_row, :] = smoothed_tile
+                _emit_tiled_row_progress(
+                    progress_callback,
+                    start_row,
+                    end_row,
+                    height,
+                    f"平滑卷积：已完成 {{index}}/{{total}} 行，核大小 {kernel_size}。",
+                )
+                _update_parallel_chunk(
+                    parallel_chunk_callback,
+                    chunk_id,
+                    "completed",
+                    chunk_total,
+                    chunk_total,
+                    f"Finished rows {start_row + 1}-{end_row}/{height}.",
+                )
+                if heartbeat_callback is not None:
+                    heartbeat_callback(
+                        f"平滑卷积：行块 {start_row + 1}-{end_row}/{height} 已完成，核大小 {kernel_size}。"
+                    )
 
     return smoothed_array
 
@@ -771,6 +951,8 @@ def fill_local_sinks(
     max_iterations: int = DEFAULT_FILL_SINK_MAX_ITERATIONS,
     progress_callback: ProgressCallback | None = None,
     heartbeat_callback: ProgressCallback | None = None,
+    parallel_work_callback: ParallelWorkCallback | None = None,
+    parallel_chunk_callback: ParallelChunkCallback | None = None,
 ) -> tuple[np.ndarray, int]:
     """
     Fill simple local depressions and repair closed flat basins.
@@ -793,6 +975,10 @@ def fill_local_sinks(
             filled_array,
             valid_mask,
             progress_callback=progress_callback,
+            heartbeat_callback=heartbeat_callback,
+            parallel_work_callback=parallel_work_callback,
+            parallel_chunk_callback=parallel_chunk_callback,
+            parallel_label=f"Sink fill iteration {iteration + 1}/{max_iterations}",
         )
         repaired_array, repaired_cells = repair_closed_flat_basins(
             updated_array,
@@ -801,6 +987,8 @@ def fill_local_sinks(
             heartbeat_callback=heartbeat_callback,
             iteration_index=iteration + 1,
             total_iterations=max_iterations,
+            parallel_work_callback=parallel_work_callback,
+            parallel_chunk_callback=parallel_chunk_callback,
         )
         filled_array = repaired_array
         total_changed_cells = changed_cells + repaired_cells
@@ -815,10 +1003,54 @@ def fill_local_sinks(
     return filled_array, iterations_used
 
 
+def fill_depressions_priority_flood(
+    height_array: np.ndarray,
+    valid_mask: np.ndarray,
+    max_fill_depth: float | None = None,
+    progress_callback: ProgressCallback | None = None,
+    heartbeat_callback: ProgressCallback | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Fill closed depressions with a single global Priority-Flood pass.
+
+    The returned fill-depth raster lets later stages keep track of where the
+    algorithm changed terrain rather than silently losing that information.
+    """
+
+    if not rust_priority_flood_available():
+        raise RuntimeError("Rust Priority-Flood kernel is not available.")
+
+    if heartbeat_callback is not None:
+        heartbeat_callback("快速填洼：开始 Rust Priority-Flood 全局填洼。")
+    filled_array = fill_depressions_priority_flood_rust(
+        height_array,
+        valid_mask,
+        max_fill_depth=max_fill_depth,
+        progress_callback=heartbeat_callback or progress_callback,
+    ).astype(np.float32, copy=False)
+    fill_depth = np.where(
+        valid_mask,
+        np.maximum(filled_array - height_array.astype(np.float32, copy=False), 0.0),
+        0.0,
+    ).astype(np.float32, copy=False)
+    if progress_callback is not None:
+        changed_cells = int((fill_depth > 0).sum())
+        maximum_depth = float(fill_depth.max(initial=0.0))
+        progress_callback(
+            f"快速填洼：已完成 Priority-Flood，修复 {changed_cells} 个像素，最大填深 {maximum_depth:.3f}。"
+        )
+
+    return filled_array, fill_depth
+
+
 def fill_sink_iteration(
     height_array: np.ndarray,
     valid_mask: np.ndarray,
     progress_callback: ProgressCallback | None = None,
+    heartbeat_callback: ProgressCallback | None = None,
+    parallel_work_callback: ParallelWorkCallback | None = None,
+    parallel_chunk_callback: ParallelChunkCallback | None = None,
+    parallel_label: str = "Local sink fill",
 ) -> tuple[np.ndarray, int]:
     """
     Execute one conservative sink-fill pass on the raster interior.
@@ -835,49 +1067,165 @@ def fill_sink_iteration(
         return updated_array, 0
 
     if progress_callback is not None:
-        progress_callback("局部填洼：开始汇总 8 邻域最低高程。")
+        progress_callback("局部填洼：开始按局部行块汇总 8 邻域信息。")
 
     padded_height = np.pad(height_array, 1, mode="constant", constant_values=np.inf).astype(np.float32)
     padded_valid = np.pad(valid_mask, 1, mode="constant", constant_values=False)
-    interior_shape = (height - 2, width - 2)
-    minimum_neighbor = np.full(interior_shape, np.inf, dtype=np.float32)
-    neighbor_sum = np.zeros(interior_shape, dtype=np.float32)
-    neighbor_count = np.zeros(interior_shape, dtype=np.int16)
-    equal_height_neighbor_count = np.zeros(interior_shape, dtype=np.int16)
-    interior_values = height_array[1:-1, 1:-1]
-
-    for direction_index, (row_delta, column_delta) in enumerate(D8_OFFSETS, start=1):
-        row_start = 2 + row_delta
-        column_start = 2 + column_delta
-        neighbor_values = padded_height[row_start : row_start + height - 2, column_start : column_start + width - 2]
-        neighbor_valid = padded_valid[row_start : row_start + height - 2, column_start : column_start + width - 2]
-        safe_neighbor_values = np.where(neighbor_valid, neighbor_values, np.inf)
-        minimum_neighbor = np.minimum(minimum_neighbor, safe_neighbor_values)
-        neighbor_sum += np.where(neighbor_valid, neighbor_values, 0.0).astype(np.float32)
-        neighbor_count += neighbor_valid.astype(np.int16)
-        equal_height_neighbor_count += (
-            neighbor_valid
-            & np.isclose(neighbor_values, interior_values)
-        ).astype(np.int16)
-        if progress_callback is not None:
-            progress_callback(f"局部填洼邻域汇总：已完成 {direction_index}/8 个方向。")
-
-    interior_valid = valid_mask[1:-1, 1:-1]
-    change_mask = interior_valid & np.isfinite(minimum_neighbor) & (interior_values < minimum_neighbor)
-    isolated_sink_mask = change_mask & (equal_height_neighbor_count == 0) & (neighbor_count > 0)
-    average_neighbor = np.divide(
-        neighbor_sum,
-        np.maximum(neighbor_count, 1),
-        dtype=np.float32,
+    interior_height = height - 2
+    interior_width = width - 2
+    worker_count = _choose_parallel_tile_workers(interior_height, interior_width)
+    row_tiles = _build_row_tiles(interior_height, worker_count)
+    chunk_specs = _build_row_tile_chunk_specs(
+        row_tiles,
+        interior_height,
+        label_prefix="Interior rows",
+        chunk_prefix="fill",
     )
-    fill_values = np.where(isolated_sink_mask, average_neighbor, minimum_neighbor)
-    updated_array[1:-1, 1:-1] = np.where(change_mask, fill_values, interior_values)
-    changed_cells = int(change_mask.sum())
+
+    def _fill_tile(start_row: int, end_row: int) -> tuple[int, int, np.ndarray, int, int]:
+        tile_height = end_row - start_row
+        tile_shape = (tile_height, interior_width)
+        minimum_neighbor = np.full(tile_shape, np.inf, dtype=np.float32)
+        neighbor_sum = np.zeros(tile_shape, dtype=np.float32)
+        neighbor_count = np.zeros(tile_shape, dtype=np.int16)
+        equal_height_neighbor_count = np.zeros(tile_shape, dtype=np.int16)
+        interior_values = height_array[1 + start_row : 1 + end_row, 1:-1]
+        interior_valid = valid_mask[1 + start_row : 1 + end_row, 1:-1]
+
+        for row_delta, column_delta in D8_OFFSETS:
+            row_start = 2 + row_delta + start_row
+            column_start = 2 + column_delta
+            neighbor_values = padded_height[
+                row_start : row_start + tile_height,
+                column_start : column_start + interior_width,
+            ]
+            neighbor_valid = padded_valid[
+                row_start : row_start + tile_height,
+                column_start : column_start + interior_width,
+            ]
+            safe_neighbor_values = np.where(neighbor_valid, neighbor_values, np.inf)
+            minimum_neighbor = np.minimum(minimum_neighbor, safe_neighbor_values)
+            neighbor_sum += np.where(neighbor_valid, neighbor_values, 0.0).astype(np.float32)
+            neighbor_count += neighbor_valid.astype(np.int16)
+            equal_height_neighbor_count += (
+                neighbor_valid
+                & np.isclose(neighbor_values, interior_values)
+            ).astype(np.int16)
+
+        change_mask = interior_valid & np.isfinite(minimum_neighbor) & (interior_values < minimum_neighbor)
+        isolated_sink_mask = change_mask & (equal_height_neighbor_count == 0) & (neighbor_count > 0)
+        average_neighbor = np.divide(
+            neighbor_sum,
+            np.maximum(neighbor_count, 1),
+            dtype=np.float32,
+        )
+        fill_values = np.where(isolated_sink_mask, average_neighbor, minimum_neighbor)
+        updated_tile = np.where(change_mask, fill_values, interior_values).astype(np.float32, copy=False)
+        return (
+            start_row,
+            end_row,
+            updated_tile,
+            int(change_mask.sum()),
+            int(isolated_sink_mask.sum()),
+        )
+
+    changed_cells = 0
+    isolated_sink_cells = 0
+    if heartbeat_callback is not None:
+        heartbeat_callback(f"局部填洼：开始按 {len(row_tiles)} 个行块计算。")
+    _publish_parallel_plan(
+        parallel_work_callback,
+        parallel_label,
+        "row_tiles",
+        chunk_specs,
+    )
+
+    if worker_count <= 1 or len(row_tiles) <= 1:
+        for chunk_index, (start_row, end_row) in enumerate(row_tiles):
+            chunk_id, _, chunk_total = chunk_specs[chunk_index]
+            _update_parallel_chunk(
+                parallel_chunk_callback,
+                chunk_id,
+                "running",
+                0,
+                chunk_total,
+                f"Computing interior rows {start_row + 1}-{end_row}/{interior_height}.",
+            )
+            tile_start, tile_end, updated_tile, tile_changed, tile_isolated = _fill_tile(start_row, end_row)
+            updated_array[1 + tile_start : 1 + tile_end, 1:-1] = updated_tile
+            changed_cells += tile_changed
+            isolated_sink_cells += tile_isolated
+            _emit_tiled_row_progress(
+                progress_callback,
+                tile_start,
+                tile_end,
+                interior_height,
+                "局部填洼：已完成内部第 {index}/{total} 行。",
+            )
+            _update_parallel_chunk(
+                parallel_chunk_callback,
+                chunk_id,
+                "completed",
+                chunk_total,
+                chunk_total,
+                (
+                    f"Finished interior rows {tile_start + 1}-{tile_end}/{interior_height}; "
+                    f"updated {tile_changed} cells."
+                ),
+            )
+            if heartbeat_callback is not None:
+                heartbeat_callback(
+                    f"局部填洼：已完成内部第 {tile_end}/{interior_height} 行。"
+                )
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="river-fill-sink") as executor:
+            future_map = {
+                executor.submit(_fill_tile, start_row, end_row): (chunk_specs[chunk_index], start_row, end_row)
+                for chunk_index, (start_row, end_row) in enumerate(row_tiles)
+            }
+            for chunk_id, _, chunk_total in chunk_specs:
+                _update_parallel_chunk(
+                    parallel_chunk_callback,
+                    chunk_id,
+                    "running",
+                    0,
+                    chunk_total,
+                    "Waiting for worker completion.",
+                )
+            for future in as_completed(future_map):
+                tile_start, tile_end, updated_tile, tile_changed, tile_isolated = future.result()
+                chunk_spec, _, _ = future_map[future]
+                chunk_id, _, chunk_total = chunk_spec
+                updated_array[1 + tile_start : 1 + tile_end, 1:-1] = updated_tile
+                changed_cells += tile_changed
+                isolated_sink_cells += tile_isolated
+                _emit_tiled_row_progress(
+                    progress_callback,
+                    tile_start,
+                    tile_end,
+                    interior_height,
+                    "局部填洼：已完成内部第 {index}/{total} 行。",
+                )
+                _update_parallel_chunk(
+                    parallel_chunk_callback,
+                    chunk_id,
+                    "completed",
+                    chunk_total,
+                    chunk_total,
+                    (
+                        f"Finished interior rows {tile_start + 1}-{tile_end}/{interior_height}; "
+                        f"updated {tile_changed} cells."
+                    ),
+                )
+                if heartbeat_callback is not None:
+                    heartbeat_callback(
+                        f"局部填洼：行块 {tile_start + 1}-{tile_end}/{interior_height} 已完成。"
+                    )
 
     if progress_callback is not None:
         progress_callback(
             "局部填洼更新完成："
-            f"本轮修复 {changed_cells} 个像素，其中单像素洼地 {int(isolated_sink_mask.sum())} 个。"
+            f"本轮修复 {changed_cells} 个像素，其中单像素洼地 {isolated_sink_cells} 个。"
         )
 
     return updated_array, changed_cells
@@ -890,6 +1238,8 @@ def repair_closed_flat_basins(
     heartbeat_callback: ProgressCallback | None = None,
     iteration_index: int = 1,
     total_iterations: int = 1,
+    parallel_work_callback: ParallelWorkCallback | None = None,
+    parallel_chunk_callback: ParallelChunkCallback | None = None,
 ) -> tuple[np.ndarray, int]:
     """
     Repair flat regions that have no lower outlet.
@@ -901,84 +1251,189 @@ def repair_closed_flat_basins(
     """
 
     repaired_array = height_array.copy()
-    visited = np.zeros_like(valid_mask, dtype=bool)
     changed_cells = 0
     epsilon = np.float32(1e-3)
     height, width = height_array.shape
     next_heartbeat_at = monotonic() + 0.75
-
-    for row_index in range(height):
-        for column_index in range(width):
-            if visited[row_index, column_index]:
-                continue
-            if not valid_mask[row_index, column_index]:
-                continue
-
-            region_cells = collect_equal_height_region(
-                row_index,
-                column_index,
-                height_array,
-                valid_mask,
-                visited,
-                heartbeat_callback=heartbeat_callback,
-                heartbeat_label=(
-                    f"填洼迭代 {iteration_index}/{total_iterations}："
-                    f"封闭平坡修复正在扩展第 {row_index + 1} 行附近的等高区。"
-                ),
+    region_items = _collect_equal_height_regions_for_sink_repair(
+        height_array,
+        valid_mask,
+        progress_callback=progress_callback,
+        heartbeat_callback=heartbeat_callback,
+        iteration_index=iteration_index,
+        total_iterations=total_iterations,
+    )
+    active_region_items = [
+        (region_label, region_cells)
+        for region_label, region_cells in region_items
+        if len(region_cells) > 1
+    ]
+    total_regions = len(active_region_items)
+    total_cells = sum(len(region_cells) for _, region_cells in active_region_items)
+    if total_regions <= 0:
+        if heartbeat_callback is not None:
+            heartbeat_callback(
+                f"填洼迭代 {iteration_index}/{total_iterations}：未发现需要分析的封闭平坡区。"
             )
-            if len(region_cells) <= 1:
-                continue
+        return repaired_array, 0
 
-            next_heartbeat_at = _emit_throttled_heartbeat(
-                heartbeat_callback,
-                next_heartbeat_at,
-                (
-                    f"填洼迭代 {iteration_index}/{total_iterations}："
-                    f"正在分析大小为 {len(region_cells)} 的封闭平坡区出口。"
-                ),
-            )
-            outlet_info = analyze_flat_region_outlets(
-                region_cells,
-                height_array,
-                valid_mask,
-                heartbeat_callback=heartbeat_callback,
-                heartbeat_label=(
-                    f"填洼迭代 {iteration_index}/{total_iterations}："
-                    f"正在扫描大小为 {len(region_cells)} 的封闭平坡区边界。"
-                ),
-            )
-            if outlet_info["has_lower_outlet"]:
-                continue
-
-            spill_elevation = outlet_info["spill_elevation"]
-            spill_anchor = outlet_info["spill_anchor"]
-            if spill_elevation is None or spill_anchor is None:
-                continue
-
-            repaired_array = impose_closed_flat_gradient(
-                repaired_array,
-                region_cells,
-                spill_anchor,
-                float(spill_elevation),
-                epsilon,
-                heartbeat_callback=heartbeat_callback,
-                heartbeat_label=(
-                    f"填洼迭代 {iteration_index}/{total_iterations}："
-                    f"正在给大小为 {len(region_cells)} 的封闭平坡区施加微坡度。"
-                ),
-            )
-            changed_cells += len(region_cells)
-
-        if progress_callback is not None:
-            progress_callback(f"封闭平坡修复：已完成 {row_index + 1}/{height} 行。")
-        next_heartbeat_at = _emit_throttled_heartbeat(
-            heartbeat_callback,
-            next_heartbeat_at,
-            (
-                f"填洼迭代 {iteration_index}/{total_iterations}："
-                f"封闭平坡修复已完成 {row_index + 1}/{height} 行。"
-            ),
+    worker_count = _choose_parallel_flat_region_workers(active_region_items)
+    region_batches = _build_flat_region_batches(active_region_items, worker_count)
+    total_batches = len(region_batches)
+    batch_chunk_specs = [
+        (
+            f"closed-flat-batch-{batch_index}",
+            f"Batch {batch_index}/{max(total_batches, 1)}",
+            max(1, sum(len(region_cells) for _, region_cells in batch_regions)),
         )
+        for batch_index, batch_regions in enumerate(region_batches, start=1)
+    ]
+    completed_regions = 0
+
+    if heartbeat_callback is not None:
+        heartbeat_callback(
+            "封闭平坡修复："
+            f"已识别 {total_regions} 个等高区候选，共 {total_cells} 个像素；"
+            f"拆分为 {total_batches} 个任务块，使用 {worker_count} 个工作线程。"
+        )
+    _publish_parallel_plan(
+        parallel_work_callback,
+        f"Closed flat repair {iteration_index}/{total_iterations}",
+        "flat_region_batches",
+        [
+            (
+                chunk_id,
+                f"{chunk_label} | {len(batch_regions)} regions | {chunk_total} px",
+                chunk_total,
+            )
+            for (chunk_id, chunk_label, chunk_total), batch_regions in zip(batch_chunk_specs, region_batches)
+        ],
+    )
+
+    if worker_count <= 1 or total_batches <= 1:
+        for batch_index, batch_regions in enumerate(region_batches, start=1):
+            chunk_id, _, chunk_total = batch_chunk_specs[batch_index - 1]
+            batch_processed_cells = 0
+            batch_changed_cells = 0
+            if heartbeat_callback is not None:
+                heartbeat_callback(
+                    "封闭平坡修复："
+                    f"开始串行处理任务块 {batch_index}/{total_batches}，"
+                    f"含 {len(batch_regions)} 个等高区，{chunk_total} 个像素。"
+                )
+
+            for _, region_cells in batch_regions:
+                updates = _compute_closed_flat_region_updates(
+                    region_cells,
+                    height_array,
+                    valid_mask,
+                    epsilon,
+                    heartbeat_callback=heartbeat_callback,
+                    heartbeat_label=(
+                        f"填洼迭代 {iteration_index}/{total_iterations}："
+                        f"正在分析大小为 {len(region_cells)} 的封闭平坡区。"
+                    ),
+                )
+                for region_row, region_column, updated_height in updates:
+                    repaired_array[region_row, region_column] = updated_height
+
+                region_cell_count = len(region_cells)
+                batch_processed_cells += region_cell_count
+                changed_cells += len(updates)
+                batch_changed_cells += len(updates)
+                completed_regions += 1
+                _update_parallel_chunk(
+                    parallel_chunk_callback,
+                    chunk_id,
+                    "running",
+                    min(batch_processed_cells, chunk_total),
+                    chunk_total,
+                    (
+                        f"Serial batch {batch_index}/{total_batches}: "
+                        f"resolved {completed_regions}/{total_regions} regions, "
+                        f"repaired {batch_changed_cells} pixels in this batch."
+                    ),
+                )
+                next_heartbeat_at = _emit_throttled_heartbeat(
+                    heartbeat_callback,
+                    next_heartbeat_at,
+                    (
+                        f"填洼迭代 {iteration_index}/{total_iterations}："
+                        f"封闭平坡修复已完成 {completed_regions}/{total_regions} 个等高区。"
+                    ),
+                )
+
+            _update_parallel_chunk(
+                parallel_chunk_callback,
+                chunk_id,
+                "completed",
+                chunk_total,
+                chunk_total,
+                (
+                    f"Finished serial closed-flat batch {batch_index}/{total_batches}; "
+                    f"repaired {batch_changed_cells} pixels."
+                ),
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="river-closed-flat") as executor:
+            pending_futures = {
+                executor.submit(
+                    _repair_closed_flat_region_batch,
+                    batch_chunk_specs[batch_index][0],
+                    batch_regions,
+                    height_array,
+                    valid_mask,
+                    epsilon,
+                    parallel_chunk_callback,
+                ): (batch_chunk_specs[batch_index], batch_regions)
+                for batch_index, batch_regions in enumerate(region_batches)
+            }
+
+            while pending_futures:
+                done_futures, _ = wait(
+                    tuple(pending_futures.keys()),
+                    timeout=0.25,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done_futures:
+                    next_heartbeat_at = _emit_throttled_heartbeat(
+                        heartbeat_callback,
+                        next_heartbeat_at,
+                        (
+                            f"填洼迭代 {iteration_index}/{total_iterations}："
+                            f"封闭平坡修复并行处理中，"
+                            f"已完成 {completed_regions}/{total_regions} 个等高区，"
+                            f"剩余 {len(pending_futures)} 个任务块。"
+                        ),
+                    )
+                    continue
+
+                for future in done_futures:
+                    batch_spec, _ = pending_futures.pop(future)
+                    chunk_id, _, chunk_total = batch_spec
+                    batch_region_count, batch_cell_count, batch_changed_cells, batch_updates = future.result()
+                    for region_row, region_column, updated_height in batch_updates:
+                        repaired_array[region_row, region_column] = updated_height
+
+                    changed_cells += batch_changed_cells
+                    completed_regions += batch_region_count
+                    _update_parallel_chunk(
+                        parallel_chunk_callback,
+                        chunk_id,
+                        "completed",
+                        chunk_total,
+                        chunk_total,
+                        (
+                            f"Finished parallel batch with {batch_region_count} regions; "
+                            f"repaired {batch_changed_cells}/{batch_cell_count} pixels."
+                        ),
+                    )
+                    if heartbeat_callback is not None:
+                        heartbeat_callback(
+                            "封闭平坡修复："
+                            f"已完成 {completed_regions}/{total_regions} 个等高区，"
+                            f"本批扫描 {batch_cell_count} 个像素，修复 {batch_changed_cells} 个像素。"
+                        )
 
     return repaired_array, changed_cells
 
@@ -1026,6 +1481,57 @@ def collect_equal_height_region(
             pending_cells.append((neighbor_row, neighbor_column))
 
     return region_cells
+
+
+def _collect_equal_height_regions_for_sink_repair(
+    height_array: np.ndarray,
+    valid_mask: np.ndarray,
+    progress_callback: ProgressCallback | None = None,
+    heartbeat_callback: ProgressCallback | None = None,
+    iteration_index: int = 1,
+    total_iterations: int = 1,
+) -> list[tuple[int, list[tuple[int, int]]]]:
+    """Collect all equal-height regions once so closed-flat repair can batch them safely."""
+
+    visited = np.zeros_like(valid_mask, dtype=bool)
+    region_items: list[tuple[int, list[tuple[int, int]]]] = []
+    height, width = height_array.shape
+    next_heartbeat_at = monotonic() + 0.75
+
+    for row_index in range(height):
+        next_heartbeat_at = _emit_throttled_heartbeat(
+            heartbeat_callback,
+            next_heartbeat_at,
+            (
+                f"填洼迭代 {iteration_index}/{total_iterations}："
+                f"封闭平坡修复正在扫描第 {row_index + 1}/{height} 行，"
+                f"已识别 {len(region_items)} 个等高区。"
+            ),
+        )
+        for column_index in range(width):
+            if visited[row_index, column_index]:
+                continue
+            if not valid_mask[row_index, column_index]:
+                continue
+
+            region_cells = collect_equal_height_region(
+                row_index,
+                column_index,
+                height_array,
+                valid_mask,
+                visited,
+                heartbeat_callback=heartbeat_callback,
+                heartbeat_label=(
+                    f"填洼迭代 {iteration_index}/{total_iterations}："
+                    f"封闭平坡修复正在扩展第 {row_index + 1} 行附近的等高区。"
+                ),
+            )
+            region_items.append((len(region_items), region_cells))
+
+        if progress_callback is not None:
+            progress_callback(f"封闭平坡修复：已完成 {row_index + 1}/{height} 行。")
+
+    return region_items
 
 
 def analyze_flat_region_outlets(
@@ -1083,22 +1589,19 @@ def analyze_flat_region_outlets(
     }
 
 
-def impose_closed_flat_gradient(
-    height_array: np.ndarray,
+def _build_closed_flat_gradient_updates(
     region_cells: list[tuple[int, int]],
     spill_anchor: tuple[int, int],
     spill_elevation: float,
     epsilon: np.float32,
     heartbeat_callback: ProgressCallback | None = None,
     heartbeat_label: str = "",
-) -> np.ndarray:
-    """Raise one closed flat basin and add a tiny monotonic slope to its spill anchor."""
+) -> list[tuple[int, int, np.float32]]:
+    """Build sparse height updates for one closed flat region without copying the full raster."""
 
-    updated_array = height_array.copy()
     region_set = set(region_cells)
     distance_map: dict[tuple[int, int], int] = {spill_anchor: 0}
     pending_cells: deque[tuple[int, int]] = deque([spill_anchor])
-    height, width = height_array.shape
     next_heartbeat_at = monotonic() + 0.75
 
     while pending_cells:
@@ -1114,8 +1617,6 @@ def impose_closed_flat_gradient(
             neighbor_row = row_index + row_delta
             neighbor_column = column_index + column_delta
             neighbor_cell = (neighbor_row, neighbor_column)
-            if neighbor_row < 0 or neighbor_row >= height or neighbor_column < 0 or neighbor_column >= width:
-                continue
             if neighbor_cell not in region_set:
                 continue
             if neighbor_cell in distance_map:
@@ -1124,11 +1625,120 @@ def impose_closed_flat_gradient(
             distance_map[neighbor_cell] = current_distance + 1
             pending_cells.append(neighbor_cell)
 
-    for row_index, column_index in region_cells:
-        distance_to_anchor = distance_map.get((row_index, column_index), 0)
-        updated_array[row_index, column_index] = np.float32(
-            spill_elevation + float(epsilon) * float(distance_to_anchor + 1)
+    return [
+        (
+            row_index,
+            column_index,
+            np.float32(spill_elevation + float(epsilon) * float(distance_map.get((row_index, column_index), 0) + 1)),
         )
+        for row_index, column_index in region_cells
+    ]
+
+
+def _compute_closed_flat_region_updates(
+    region_cells: list[tuple[int, int]],
+    height_array: np.ndarray,
+    valid_mask: np.ndarray,
+    epsilon: np.float32,
+    heartbeat_callback: ProgressCallback | None = None,
+    heartbeat_label: str = "",
+) -> list[tuple[int, int, np.float32]]:
+    """Compute sparse updates for one closed flat region if it has no real outlet."""
+
+    if len(region_cells) <= 1:
+        return []
+
+    outlet_info = analyze_flat_region_outlets(
+        region_cells,
+        height_array,
+        valid_mask,
+        heartbeat_callback=heartbeat_callback,
+        heartbeat_label=heartbeat_label or f"封闭平坡修复：正在扫描大小为 {len(region_cells)} 的等高区边界。",
+    )
+    if outlet_info["has_lower_outlet"]:
+        return []
+
+    spill_elevation = outlet_info["spill_elevation"]
+    spill_anchor = outlet_info["spill_anchor"]
+    if spill_elevation is None or spill_anchor is None:
+        return []
+
+    return _build_closed_flat_gradient_updates(
+        region_cells,
+        spill_anchor,
+        float(spill_elevation),
+        epsilon,
+        heartbeat_callback=heartbeat_callback,
+        heartbeat_label=heartbeat_label or f"封闭平坡修复：正在给大小为 {len(region_cells)} 的等高区施加微坡度。",
+    )
+
+
+def _repair_closed_flat_region_batch(
+    chunk_id: str,
+    batch_regions: list[tuple[int, list[tuple[int, int]]]],
+    height_array: np.ndarray,
+    valid_mask: np.ndarray,
+    epsilon: np.float32,
+    parallel_chunk_callback: ParallelChunkCallback | None = None,
+) -> tuple[int, int, int, list[tuple[int, int, np.float32]]]:
+    """Repair one weighted batch of equal-height regions and return sparse updates."""
+
+    total_batch_cells = max(1, sum(len(region_cells) for _, region_cells in batch_regions))
+    batch_cell_count = 0
+    batch_changed_cells = 0
+    processed_cells = 0
+    batch_updates: list[tuple[int, int, np.float32]] = []
+    total_regions = len(batch_regions)
+
+    for region_index, (_, region_cells) in enumerate(batch_regions, start=1):
+        region_cell_count = len(region_cells)
+        region_updates = _compute_closed_flat_region_updates(
+            region_cells,
+            height_array,
+            valid_mask,
+            epsilon,
+            heartbeat_callback=None,
+        )
+        batch_updates.extend(region_updates)
+        batch_cell_count += region_cell_count
+        batch_changed_cells += len(region_updates)
+        processed_cells += region_cell_count
+        _update_parallel_chunk(
+            parallel_chunk_callback,
+            chunk_id,
+            "completed" if region_index == total_regions else "running",
+            processed_cells,
+            total_batch_cells,
+            (
+                f"Resolved {region_index}/{total_regions} equal-height regions; "
+                f"repaired {batch_changed_cells} pixels in this batch."
+            ),
+        )
+
+    return len(batch_regions), batch_cell_count, batch_changed_cells, batch_updates
+
+
+def impose_closed_flat_gradient(
+    height_array: np.ndarray,
+    region_cells: list[tuple[int, int]],
+    spill_anchor: tuple[int, int],
+    spill_elevation: float,
+    epsilon: np.float32,
+    heartbeat_callback: ProgressCallback | None = None,
+    heartbeat_label: str = "",
+) -> np.ndarray:
+    """Raise one closed flat basin and add a tiny monotonic slope to its spill anchor."""
+
+    updated_array = height_array.copy()
+    for row_index, column_index, updated_height in _build_closed_flat_gradient_updates(
+        region_cells,
+        spill_anchor,
+        spill_elevation,
+        epsilon,
+        heartbeat_callback=heartbeat_callback,
+        heartbeat_label=heartbeat_label,
+    ):
+        updated_array[row_index, column_index] = updated_height
 
     return updated_array
 
@@ -1157,6 +1767,21 @@ def terrain_preview_image(
     return Image.fromarray(preview_array, mode="L")
 
 
+def fill_depth_preview_image(fill_depth: np.ndarray, valid_mask: np.ndarray) -> Image.Image:
+    """Render fill-depth changes as a grayscale diagnostic preview."""
+
+    preview_array = np.zeros(fill_depth.shape, dtype=np.uint8)
+    changed_mask = valid_mask & (fill_depth > 0)
+    if changed_mask.any():
+        maximum_value = float(fill_depth[changed_mask].max(initial=0.0))
+        if maximum_value > 0.0:
+            preview_array[changed_mask] = (
+                np.clip(fill_depth[changed_mask] / maximum_value, 0.0, 1.0) * 255.0
+            ).astype(np.uint8)
+
+    return Image.fromarray(preview_array, mode="L")
+
+
 def terrain_statistics_message(
     height_array: np.ndarray,
     valid_mask: np.ndarray,
@@ -1180,26 +1805,24 @@ def _build_neighbor_lookup(
 
     neighbor_rows = np.full((8, height, width), -1, dtype=np.int32)
     neighbor_columns = np.full((8, height, width), -1, dtype=np.int32)
-    next_heartbeat_at = monotonic() + 0.75
+    row_grid = np.arange(height, dtype=np.int32)[:, None]
+    column_grid = np.arange(width, dtype=np.int32)[None, :]
+    if heartbeat_callback is not None:
+        heartbeat_callback("D8 1/4 严格坡降：开始预构建邻域索引。")
 
     for direction_index, (row_delta, column_delta) in enumerate(D8_OFFSETS):
-        for row_index in range(height):
-            for column_index in range(width):
-                neighbor_row = row_index + row_delta
-                neighbor_column = column_index + column_delta
-                if neighbor_row < 0 or neighbor_row >= height or neighbor_column < 0 or neighbor_column >= width:
-                    continue
-
-                neighbor_rows[direction_index, row_index, column_index] = neighbor_row
-                neighbor_columns[direction_index, row_index, column_index] = neighbor_column
-                next_heartbeat_at = _emit_throttled_heartbeat(
-                    heartbeat_callback,
-                    next_heartbeat_at,
-                    (
-                        "D8 1/4 严格坡降：邻域索引预构建，"
-                        f"方向 {direction_index + 1}/8，第 {row_index + 1}/{height} 行。"
-                    ),
-                )
+        shifted_rows = row_grid + np.int32(row_delta)
+        shifted_columns = column_grid + np.int32(column_delta)
+        valid_rows = (shifted_rows >= 0) & (shifted_rows < height)
+        valid_columns = (shifted_columns >= 0) & (shifted_columns < width)
+        valid_neighbors = valid_rows & valid_columns
+        neighbor_rows[direction_index] = np.where(valid_neighbors, shifted_rows, -1).astype(np.int32, copy=False)
+        neighbor_columns[direction_index] = np.where(valid_neighbors, shifted_columns, -1).astype(np.int32, copy=False)
+        if heartbeat_callback is not None:
+            heartbeat_callback(
+                "D8 1/4 严格坡降：邻域索引预构建，"
+                f"已完成方向 {direction_index + 1}/8。"
+            )
 
     return neighbor_rows, neighbor_columns
 
@@ -1212,53 +1835,128 @@ def _compute_strict_d8_pass(
     slope_weight: float,
     progress_callback: ProgressCallback | None = None,
     heartbeat_callback: ProgressCallback | None = None,
+    parallel_work_callback: ParallelWorkCallback | None = None,
+    parallel_chunk_callback: ParallelChunkCallback | None = None,
 ) -> np.ndarray:
     """Assign directions only when a strictly lower neighbor exists."""
 
     height, width = height_array.shape
     direction_array = np.full((height, width), -1, dtype=np.int8)
-    next_heartbeat_at = monotonic() + 0.75
+    worker_count = _choose_parallel_tile_workers(height, width)
+    row_tiles = _build_row_tiles(height, worker_count)
+    chunk_specs = _build_row_tile_chunk_specs(
+        row_tiles,
+        height,
+        label_prefix="Rows",
+        chunk_prefix="strict-d8",
+    )
 
-    for row_index in range(height):
-        for column_index in range(width):
-            if not valid_mask[row_index, column_index]:
-                continue
-            next_heartbeat_at = _emit_throttled_heartbeat(
-                heartbeat_callback,
-                next_heartbeat_at,
-                f"D8 1/4 严格坡降：正在扫描第 {row_index + 1}/{height} 行。",
+    def _compute_tile(start_row: int, end_row: int) -> tuple[int, int, np.ndarray]:
+        tile_rows = end_row - start_row
+        if tile_rows <= 0:
+            return start_row, end_row, np.empty((0, width), dtype=np.int8)
+
+        tile_neighbor_rows = neighbor_rows[:, start_row:end_row, :]
+        tile_neighbor_columns = neighbor_columns[:, start_row:end_row, :]
+        valid_neighbors = (tile_neighbor_rows >= 0) & (tile_neighbor_columns >= 0)
+        safe_neighbor_rows = np.where(valid_neighbors, tile_neighbor_rows, 0)
+        safe_neighbor_columns = np.where(valid_neighbors, tile_neighbor_columns, 0)
+        neighbor_heights = height_array[safe_neighbor_rows, safe_neighbor_columns]
+        neighbor_valid = valid_mask[safe_neighbor_rows, safe_neighbor_columns] & valid_neighbors
+        current_heights = height_array[start_row:end_row, :][None, :, :]
+        height_drop = current_heights - neighbor_heights
+        raw_slopes = np.where(
+            neighbor_valid & (height_drop > 0.0),
+            height_drop / D8_DISTANCES[:, None, None],
+            0.0,
+        ).astype(np.float32, copy=False)
+        best_scores = raw_slopes.max(axis=0)
+        best_directions = raw_slopes.argmax(axis=0).astype(np.int8, copy=False)
+        tile_direction = np.where(
+            valid_mask[start_row:end_row, :] & (best_scores > 0.0),
+            best_directions,
+            np.int8(-1),
+        ).astype(np.int8, copy=False)
+        return start_row, end_row, tile_direction
+
+    if heartbeat_callback is not None:
+        heartbeat_callback(f"D8 1/4 严格坡降：开始按 {len(row_tiles)} 个行块计算。")
+    _publish_parallel_plan(
+        parallel_work_callback,
+        "D8 strict downhill",
+        "row_tiles",
+        chunk_specs,
+    )
+
+    if worker_count <= 1 or len(row_tiles) <= 1:
+        for chunk_index, (start_row, end_row) in enumerate(row_tiles):
+            chunk_id, _, chunk_total = chunk_specs[chunk_index]
+            _update_parallel_chunk(
+                parallel_chunk_callback,
+                chunk_id,
+                "running",
+                0,
+                chunk_total,
+                f"Computing rows {start_row + 1}-{end_row}/{height}.",
             )
-            current_height = float(height_array[row_index, column_index])
-            raw_slopes = np.zeros(8, dtype=np.float32)
-
-            for direction_index in range(8):
-                neighbor_row = int(neighbor_rows[direction_index, row_index, column_index])
-                neighbor_column = int(neighbor_columns[direction_index, row_index, column_index])
-                if neighbor_row < 0 or neighbor_column < 0:
-                    continue
-                if not valid_mask[neighbor_row, neighbor_column]:
-                    continue
-
-                neighbor_height = float(height_array[neighbor_row, neighbor_column])
-                height_drop = current_height - neighbor_height
-                if height_drop <= 0:
-                    continue
-
-                raw_slopes[direction_index] = height_drop / float(D8_DISTANCES[direction_index])
-
-            direction_array[row_index, column_index] = _select_best_scored_direction(
-                slope_scores=_normalize_scores(raw_slopes),
-                flat_escape_scores=np.zeros(8, dtype=np.float32),
-                outlet_proximity_scores=np.zeros(8, dtype=np.float32),
-                continuity_scores=np.zeros(8, dtype=np.float32),
-                slope_weight=slope_weight,
-                flat_escape_weight=0.0,
-                outlet_proximity_weight=0.0,
-                continuity_weight=0.0,
+            _, _, tile_direction = _compute_tile(start_row, end_row)
+            direction_array[start_row:end_row, :] = tile_direction
+            _emit_tiled_row_progress(
+                progress_callback,
+                start_row,
+                end_row,
+                height,
+                "D8 1/4 严格坡降：已完成 {index}/{total} 行。",
             )
-
-        if progress_callback is not None:
-            progress_callback(f"D8 1/4 严格坡降：已完成 {row_index + 1}/{height} 行。")
+            _update_parallel_chunk(
+                parallel_chunk_callback,
+                chunk_id,
+                "completed",
+                chunk_total,
+                chunk_total,
+                f"Finished rows {start_row + 1}-{end_row}/{height}.",
+            )
+            if heartbeat_callback is not None:
+                heartbeat_callback(f"D8 1/4 严格坡降：已完成第 {end_row}/{height} 行。")
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="river-strict-d8") as executor:
+            future_map = {
+                executor.submit(_compute_tile, start_row, end_row): (chunk_specs[chunk_index], start_row, end_row)
+                for chunk_index, (start_row, end_row) in enumerate(row_tiles)
+            }
+            for chunk_id, _, chunk_total in chunk_specs:
+                _update_parallel_chunk(
+                    parallel_chunk_callback,
+                    chunk_id,
+                    "running",
+                    0,
+                    chunk_total,
+                    "Waiting for worker completion.",
+                )
+            for future in as_completed(future_map):
+                start_row, end_row, tile_direction = future.result()
+                chunk_spec, _, _ = future_map[future]
+                chunk_id, _, chunk_total = chunk_spec
+                direction_array[start_row:end_row, :] = tile_direction
+                _emit_tiled_row_progress(
+                    progress_callback,
+                    start_row,
+                    end_row,
+                    height,
+                    "D8 1/4 严格坡降：已完成 {index}/{total} 行。",
+                )
+                _update_parallel_chunk(
+                    parallel_chunk_callback,
+                    chunk_id,
+                    "completed",
+                    chunk_total,
+                    chunk_total,
+                    f"Finished rows {start_row + 1}-{end_row}/{height}.",
+                )
+                if heartbeat_callback is not None:
+                    heartbeat_callback(
+                        f"D8 1/4 严格坡降：行块 {start_row + 1}-{end_row}/{height} 已完成。"
+                    )
 
     return direction_array
 
@@ -1625,6 +2323,7 @@ def _choose_flat_neighbor_direction(
     flat_escape_weight: float,
     outlet_proximity_weight: float,
     continuity_weight: float,
+    texture_height_array: np.ndarray | None = None,
 ) -> int:
     """Pick a same-region neighbor via weighted flat-routing scores."""
 
@@ -1633,6 +2332,7 @@ def _choose_flat_neighbor_direction(
         return -1
 
     flat_escape_scores = np.zeros(8, dtype=np.float32)
+    texture_raw = np.zeros(8, dtype=np.float32)
     outlet_proximity_raw = np.zeros(8, dtype=np.float32)
     continuity_raw = np.zeros(8, dtype=np.float32)
     segment_strength = float(outlet_segments[segment_index]["strength"])
@@ -1652,6 +2352,10 @@ def _choose_flat_neighbor_direction(
             continue
 
         flat_escape_scores[direction_index] = (current_distance - neighbor_distance) / max(current_distance, 1)
+        if texture_height_array is not None:
+            current_texture_height = float(texture_height_array[row_index, column_index])
+            neighbor_texture_height = float(texture_height_array[neighbor_row, neighbor_column])
+            texture_raw[direction_index] = max(0.0, current_texture_height - neighbor_texture_height)
         outlet_proximity_raw[direction_index] = segment_strength / (1.0 + float(neighbor_distance))
         candidate_row_delta = float(neighbor_row - row_index)
         candidate_column_delta = float(neighbor_column - column_index)
@@ -1666,7 +2370,7 @@ def _choose_flat_neighbor_direction(
             continuity_raw[direction_index] = max(0.0, alignment)
 
     return _select_best_scored_direction(
-        slope_scores=np.zeros(8, dtype=np.float32),
+        slope_scores=_normalize_scores(texture_raw),
         flat_escape_scores=flat_escape_scores,
         outlet_proximity_scores=_normalize_scores(outlet_proximity_raw),
         continuity_scores=_normalize_scores(continuity_raw),
@@ -1675,6 +2379,205 @@ def _choose_flat_neighbor_direction(
         outlet_proximity_weight=outlet_proximity_weight,
         continuity_weight=continuity_weight,
     )
+
+
+def _choose_parallel_flat_region_workers(
+    region_items: list[tuple[int, list[tuple[int, int]]]],
+) -> int:
+    """Choose a conservative worker count for independent flat-region batches."""
+
+    total_regions = len(region_items)
+    if total_regions <= 1 or MAX_PARALLEL_REGION_WORKERS <= 1:
+        return 1
+
+    total_cells = sum(len(region_cells) for _, region_cells in region_items)
+    if total_cells < FLAT_REGION_PARALLEL_MIN_CELLS:
+        return 1
+
+    recommended_workers = max(1, total_cells // FLAT_REGION_PARALLEL_MIN_CELLS)
+    return min(MAX_PARALLEL_REGION_WORKERS, total_regions, recommended_workers)
+
+
+def _build_flat_region_batches(
+    region_items: list[tuple[int, list[tuple[int, int]]]],
+    worker_count: int,
+) -> list[list[tuple[int, list[tuple[int, int]]]]]:
+    """Group flat regions into unequal batches balanced by total cell count."""
+
+    if not region_items:
+        return []
+    if worker_count <= 1:
+        return [region_items]
+
+    target_batch_count = min(len(region_items), max(worker_count, worker_count * 4))
+    sorted_items = sorted(region_items, key=lambda item: len(item[1]), reverse=True)
+    batch_loads = [0] * target_batch_count
+    batches: list[list[tuple[int, list[tuple[int, int]]]]] = [[] for _ in range(target_batch_count)]
+
+    for region_item in sorted_items:
+        lightest_index = min(range(target_batch_count), key=batch_loads.__getitem__)
+        batches[lightest_index].append(region_item)
+        batch_loads[lightest_index] += len(region_item[1])
+
+    return [batch for batch in batches if batch]
+
+
+def _resolve_single_flat_region(
+    region_cells: list[tuple[int, int]],
+    height_array: np.ndarray,
+    valid_mask: np.ndarray,
+    direction_array: np.ndarray,
+    neighbor_rows: np.ndarray,
+    neighbor_columns: np.ndarray,
+    slope_weight: float,
+    flat_escape_weight: float,
+    outlet_proximity_weight: float,
+    continuity_weight: float,
+    flat_outlet_length_weight: float,
+    flat_outlet_distance_weight: float,
+    heartbeat_callback: ProgressCallback | None = None,
+    outlet_drop_map: np.ndarray | None = None,
+    texture_height_array: np.ndarray | None = None,
+) -> list[tuple[int, int, int]]:
+    """Resolve one independent flat region and return sparse direction updates."""
+
+    if len(region_cells) <= 1:
+        return []
+    if not any(int(direction_array[row_index, column_index]) == -1 for row_index, column_index in region_cells):
+        return []
+
+    outlet_segments = _extract_outlet_segments(
+        region_cells,
+        height_array,
+        valid_mask,
+        neighbor_rows,
+        neighbor_columns,
+        flat_outlet_length_weight,
+        heartbeat_callback=heartbeat_callback,
+        outlet_drop_map=outlet_drop_map,
+    )
+    if not outlet_segments:
+        return []
+
+    assignment, distance_map = _assign_flat_region_segments(
+        region_cells,
+        outlet_segments,
+        neighbor_rows,
+        neighbor_columns,
+        flat_outlet_distance_weight,
+        heartbeat_callback=heartbeat_callback,
+    )
+
+    updates: list[tuple[int, int, int]] = []
+    total_region_cells = len(region_cells)
+    next_heartbeat_at = monotonic() + 0.75
+
+    for cell_offset, (region_row, region_column) in enumerate(region_cells, start=1):
+        next_heartbeat_at = _emit_throttled_heartbeat(
+            heartbeat_callback,
+            next_heartbeat_at,
+            (
+                "D8 2/4 平坡导流：单个平坡区方向分配中，"
+                f"已扫描 {cell_offset}/{total_region_cells} 个像素。"
+            ),
+        )
+        if int(direction_array[region_row, region_column]) != -1:
+            continue
+
+        chosen_segment = assignment.get((region_row, region_column))
+        if chosen_segment is None:
+            continue
+
+        best_direction = _choose_flat_neighbor_direction(
+            region_row,
+            region_column,
+            chosen_segment,
+            assignment,
+            distance_map,
+            outlet_segments,
+            neighbor_rows,
+            neighbor_columns,
+            slope_weight,
+            flat_escape_weight,
+            outlet_proximity_weight,
+            continuity_weight,
+            texture_height_array=texture_height_array,
+        )
+        if best_direction >= 0:
+            updates.append((region_row, region_column, best_direction))
+
+    return updates
+
+
+def _resolve_flat_region_batch(
+    chunk_id: str,
+    batch_regions: list[tuple[int, list[tuple[int, int]]]],
+    height_array: np.ndarray,
+    valid_mask: np.ndarray,
+    direction_array: np.ndarray,
+    neighbor_rows: np.ndarray,
+    neighbor_columns: np.ndarray,
+    slope_weight: float,
+    flat_escape_weight: float,
+    outlet_proximity_weight: float,
+    continuity_weight: float,
+    flat_outlet_length_weight: float,
+    flat_outlet_distance_weight: float,
+    outlet_drop_map: np.ndarray | None,
+    texture_height_array: np.ndarray | None,
+    parallel_chunk_callback: ParallelChunkCallback | None = None,
+) -> tuple[int, int, list[tuple[int, int, int]]]:
+    """Resolve one weighted batch of flat regions and return sparse updates."""
+
+    total_batch_cells = max(1, sum(len(cells) for _, cells in batch_regions))
+    batch_cell_count = 0
+    processed_cells = 0
+    batch_updates: list[tuple[int, int, int]] = []
+    total_regions = len(batch_regions)
+
+    for region_index, (_, region_cells) in enumerate(batch_regions, start=1):
+        region_cell_count = len(region_cells)
+        batch_cell_count += region_cell_count
+        if region_index == 1:
+            _update_parallel_chunk(
+                parallel_chunk_callback,
+                chunk_id,
+                "running",
+                0,
+                total_batch_cells,
+                f"Resolving flat regions: 0/{total_regions} regions completed.",
+            )
+        batch_updates.extend(
+            _resolve_single_flat_region(
+                region_cells,
+                height_array,
+                valid_mask,
+                direction_array,
+                neighbor_rows,
+                neighbor_columns,
+                slope_weight,
+                flat_escape_weight,
+                outlet_proximity_weight,
+                continuity_weight,
+                flat_outlet_length_weight,
+                flat_outlet_distance_weight,
+                heartbeat_callback=None,
+                outlet_drop_map=outlet_drop_map,
+                texture_height_array=texture_height_array,
+            )
+        )
+        processed_cells += region_cell_count
+        next_status = "completed" if region_index == total_regions else "running"
+        _update_parallel_chunk(
+            parallel_chunk_callback,
+            chunk_id,
+            next_status,
+            processed_cells,
+            total_batch_cells,
+            f"Resolved {region_index}/{total_regions} flat regions in this batch.",
+        )
+
+    return len(batch_regions), batch_cell_count, batch_updates
 
 
 def _resolve_flat_regions(
@@ -1692,6 +2595,9 @@ def _resolve_flat_regions(
     progress_callback: ProgressCallback | None = None,
     heartbeat_callback: ProgressCallback | None = None,
     use_rust_kernel: bool = False,
+    parallel_work_callback: ParallelWorkCallback | None = None,
+    parallel_chunk_callback: ParallelChunkCallback | None = None,
+    texture_height_array: np.ndarray | None = None,
 ) -> np.ndarray:
     """Assign flow directions inside flat regions that have real downstream outlets."""
 
@@ -1720,77 +2626,197 @@ def _resolve_flat_regions(
 
     region_groups = _group_region_cells_by_label(region_labels)
     region_items = sorted(region_groups.items(), key=lambda item: item[0])
-    total_regions = len(region_items)
+    active_region_items = [
+        (region_label, region_cells)
+        for region_label, region_cells in region_items
+        if len(region_cells) > 1
+        and any(int(direction_array[row_index, column_index]) == -1 for row_index, column_index in region_cells)
+    ]
+    total_regions = len(active_region_items)
+    if total_regions <= 0:
+        if heartbeat_callback is not None:
+            heartbeat_callback("D8 2/4 平坡导流：没有需要额外导流的平坡区。")
+        return resolved_directions
+
+    worker_count = _choose_parallel_flat_region_workers(active_region_items)
+    region_batches = _build_flat_region_batches(active_region_items, worker_count)
+    total_batches = len(region_batches)
+    batch_chunk_specs = [
+        (
+            f"flat-batch-{batch_index}",
+            f"Batch {batch_index}/{max(total_batches, 1)}",
+            max(1, sum(len(region_cells) for _, region_cells in batch_regions)),
+        )
+        for batch_index, batch_regions in enumerate(region_batches, start=1)
+    ]
+    completed_regions = 0
+    completed_batches = 0
+    completed_cells = 0
+    total_cells = sum(len(region_cells) for _, region_cells in active_region_items)
     next_heartbeat_at = monotonic() + 0.75
 
-    for region_offset, (_, region_cells) in enumerate(region_items, start=1):
-        if heartbeat_callback is not None and monotonic() >= next_heartbeat_at:
-            heartbeat_callback(
-                f"D8 2/4 平坡导流：正在处理第 {region_offset}/{max(total_regions, 1)} 个平坡区。"
+    if heartbeat_callback is not None:
+        heartbeat_callback(
+            "D8 2/4 平坡导流："
+            f"已识别 {total_regions} 个待处理平坡区，共 {total_cells} 个像素，"
+            f"拆分为 {total_batches} 个不等大任务块，使用 {worker_count} 个工作线程。"
+        )
+    _publish_parallel_plan(
+        parallel_work_callback,
+        "D8 flat routing",
+        "flat_region_batches",
+        [
+            (
+                chunk_id,
+                f"{chunk_label} | {len(batch_regions)} regions | {chunk_total} px",
+                chunk_total,
             )
-            next_heartbeat_at = monotonic() + 0.75
-        if len(region_cells) <= 1:
-            continue
-        if not any(int(direction_array[row_index, column_index]) == -1 for row_index, column_index in region_cells):
-            continue
+            for (chunk_id, chunk_label, chunk_total), batch_regions in zip(batch_chunk_specs, region_batches)
+        ],
+    )
 
-        outlet_segments = _extract_outlet_segments(
-            region_cells,
-            height_array,
-            valid_mask,
-            neighbor_rows,
-            neighbor_columns,
-            flat_outlet_length_weight,
-            heartbeat_callback=heartbeat_callback,
-            outlet_drop_map=outlet_drop_map,
-        )
-        if not outlet_segments:
-            continue
-
-        assignment, distance_map = _assign_flat_region_segments(
-            region_cells,
-            outlet_segments,
-            neighbor_rows,
-            neighbor_columns,
-            flat_outlet_distance_weight,
-            heartbeat_callback=heartbeat_callback,
-        )
-
-        total_region_cells = len(region_cells)
-        for cell_offset, (region_row, region_column) in enumerate(region_cells, start=1):
-            if heartbeat_callback is not None and monotonic() >= next_heartbeat_at:
+    if worker_count <= 1 or total_batches <= 1:
+        for batch_index, batch_regions in enumerate(region_batches, start=1):
+            chunk_id, _, chunk_total = batch_chunk_specs[batch_index - 1]
+            batch_cell_count = sum(len(region_cells) for _, region_cells in batch_regions)
+            batch_processed_cells = 0
+            if heartbeat_callback is not None:
                 heartbeat_callback(
                     "D8 2/4 平坡导流："
-                    f"第 {region_offset}/{max(total_regions, 1)} 个平坡区，"
-                    f"已扫描 {cell_offset}/{total_region_cells} 个像素。"
+                    f"开始串行处理任务块 {batch_index}/{total_batches}，"
+                    f"含 {len(batch_regions)} 个平坡区，{batch_cell_count} 个像素。"
                 )
-                next_heartbeat_at = monotonic() + 0.75
-            if int(direction_array[region_row, region_column]) != -1:
-                continue
 
-            chosen_segment = assignment.get((region_row, region_column))
-            if chosen_segment is None:
-                continue
+            for _, region_cells in batch_regions:
+                updates = _resolve_single_flat_region(
+                    region_cells,
+                    height_array,
+                    valid_mask,
+                    direction_array,
+                    neighbor_rows,
+                    neighbor_columns,
+                    slope_weight,
+                    flat_escape_weight,
+                    outlet_proximity_weight,
+                    continuity_weight,
+                    flat_outlet_length_weight,
+                    flat_outlet_distance_weight,
+                    heartbeat_callback=heartbeat_callback,
+                    outlet_drop_map=outlet_drop_map,
+                    texture_height_array=texture_height_array,
+                )
+                for region_row, region_column, best_direction in updates:
+                    resolved_directions[region_row, region_column] = best_direction
+                completed_regions += 1
+                completed_cells += len(region_cells)
+                batch_processed_cells += len(region_cells)
+                _update_parallel_chunk(
+                    parallel_chunk_callback,
+                    chunk_id,
+                    "running",
+                    min(batch_processed_cells, chunk_total),
+                    chunk_total,
+                    f"Serial batch {batch_index}/{total_batches} is still resolving regions.",
+                )
+                if progress_callback is not None:
+                    progress_callback(
+                        f"D8 2/4 平坡导流：已完成 {completed_regions}/{max(total_regions, 1)} 个平坡区。"
+                    )
+                if heartbeat_callback is not None:
+                    heartbeat_callback(
+                        "D8 2/4 平坡导流："
+                        f"已完成 {completed_regions}/{total_regions} 个平坡区，"
+                        f"累计覆盖 {completed_cells}/{total_cells} 个像素。"
+                    )
 
-            best_direction = _choose_flat_neighbor_direction(
-                region_row,
-                region_column,
-                chosen_segment,
-                assignment,
-                distance_map,
-                outlet_segments,
-                neighbor_rows,
-                neighbor_columns,
-                slope_weight,
-                flat_escape_weight,
-                outlet_proximity_weight,
-                continuity_weight,
+            completed_batches += 1
+            _update_parallel_chunk(
+                parallel_chunk_callback,
+                chunk_id,
+                "completed",
+                chunk_total,
+                chunk_total,
+                f"Finished serial flat batch {batch_index}/{total_batches}.",
             )
-            if best_direction >= 0:
-                resolved_directions[region_row, region_column] = best_direction
+            if heartbeat_callback is not None:
+                heartbeat_callback(
+                    f"D8 2/4 平坡导流：任务块 {completed_batches}/{total_batches} 已完成。"
+                )
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="river-flat") as executor:
+            pending_futures = {
+                executor.submit(
+                    _resolve_flat_region_batch,
+                    batch_chunk_specs[batch_index][0],
+                    batch_regions,
+                    height_array,
+                    valid_mask,
+                    direction_array,
+                    neighbor_rows,
+                    neighbor_columns,
+                    slope_weight,
+                    flat_escape_weight,
+                    outlet_proximity_weight,
+                    continuity_weight,
+                    flat_outlet_length_weight,
+                    flat_outlet_distance_weight,
+                    outlet_drop_map,
+                    texture_height_array,
+                    parallel_chunk_callback,
+                ): (batch_chunk_specs[batch_index], batch_regions)
+                for batch_index, batch_regions in enumerate(region_batches)
+            }
 
-        if progress_callback is not None:
-            progress_callback(f"D8 2/4 平坡导流：已完成 {region_offset}/{max(total_regions, 1)} 个平坡区。")
+            while pending_futures:
+                done_futures, _ = wait(
+                    tuple(pending_futures.keys()),
+                    timeout=0.25,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done_futures:
+                    next_heartbeat_at = _emit_throttled_heartbeat(
+                        heartbeat_callback,
+                        next_heartbeat_at,
+                        (
+                            "D8 2/4 平坡导流：并行处理中，"
+                            f"已完成 {completed_regions}/{total_regions} 个平坡区，"
+                            f"剩余 {len(pending_futures)} 个任务块。"
+                        ),
+                    )
+                    continue
+
+                for future in done_futures:
+                    batch_spec, batch_regions = pending_futures.pop(future)
+                    chunk_id, _, chunk_total = batch_spec
+                    batch_region_count, batch_cell_count, batch_updates = future.result()
+                    for region_row, region_column, best_direction in batch_updates:
+                        resolved_directions[region_row, region_column] = best_direction
+
+                    completed_batches += 1
+                    completed_cells += batch_cell_count
+                    for _ in range(batch_region_count):
+                        completed_regions += 1
+                        if progress_callback is not None:
+                            progress_callback(
+                                f"D8 2/4 平坡导流：已完成 {completed_regions}/{max(total_regions, 1)} 个平坡区。"
+                            )
+
+                    _update_parallel_chunk(
+                        parallel_chunk_callback,
+                        chunk_id,
+                        "completed",
+                        chunk_total,
+                        chunk_total,
+                        f"Finished parallel flat batch {completed_batches}/{total_batches}.",
+                    )
+                    if heartbeat_callback is not None:
+                        heartbeat_callback(
+                            "D8 2/4 平坡导流："
+                            f"任务块 {completed_batches}/{total_batches} 已完成，"
+                            f"本块含 {len(batch_regions)} 个平坡区，"
+                            f"{batch_cell_count} 个像素；"
+                            f"累计完成 {completed_regions}/{total_regions} 个平坡区。"
+                        )
 
     return resolved_directions
 
@@ -2388,6 +3414,7 @@ def _resolve_residual_unassigned_flows(
 def compute_d8_flow_directions(
     height_array: np.ndarray,
     valid_mask: np.ndarray | None = None,
+    texture_height_array: np.ndarray | None = None,
     use_rust_kernel: bool = False,
     slope_weight: float = DEFAULT_SLOPE_WEIGHT,
     flat_escape_weight: float = DEFAULT_FLAT_ESCAPE_WEIGHT,
@@ -2403,6 +3430,9 @@ def compute_d8_flow_directions(
     residual_heartbeat_callback: ProgressCallback | None = None,
     cycle_progress_callback: ProgressCallback | None = None,
     cycle_heartbeat_callback: ProgressCallback | None = None,
+    parallel_work_callback: ParallelWorkCallback | None = None,
+    parallel_chunk_callback: ParallelChunkCallback | None = None,
+    clear_parallel_work_callback: ParallelClearCallback | None = None,
 ) -> np.ndarray:
     """Compute one downstream direction for each terrain cell, including flat routing."""
 
@@ -2415,7 +3445,7 @@ def compute_d8_flow_directions(
         width,
         heartbeat_callback=strict_heartbeat_callback or flat_heartbeat_callback,
     )
-    if use_rust_kernel and rust_kernel_available():
+    if use_rust_kernel and rust_strict_d8_available():
         direction_array = compute_strict_d8_rust(
             height_array,
             working_valid_mask,
@@ -2430,6 +3460,8 @@ def compute_d8_flow_directions(
             slope_weight,
             progress_callback=strict_progress_callback,
             heartbeat_callback=strict_heartbeat_callback,
+            parallel_work_callback=parallel_work_callback,
+            parallel_chunk_callback=parallel_chunk_callback,
         )
     direction_array = _resolve_flat_regions(
         height_array,
@@ -2446,7 +3478,12 @@ def compute_d8_flow_directions(
         progress_callback=flat_progress_callback,
         heartbeat_callback=flat_heartbeat_callback,
         use_rust_kernel=use_rust_kernel,
+        parallel_work_callback=parallel_work_callback,
+        parallel_chunk_callback=parallel_chunk_callback,
+        texture_height_array=texture_height_array,
     )
+    if clear_parallel_work_callback is not None:
+        clear_parallel_work_callback()
     direction_array = _resolve_residual_unassigned_flows(
         height_array,
         working_valid_mask,
@@ -2486,51 +3523,73 @@ def compute_flow_accumulation(
     index_progress_callback: ProgressCallback | None = None,
     propagate_progress_callback: ProgressCallback | None = None,
     heartbeat_callback: ProgressCallback | None = None,
+    use_rust_kernel: bool = False,
 ) -> np.ndarray:
     """Compute upstream accumulation by propagating totals downstream."""
 
     height, width = direction_array.shape
+    if use_rust_kernel and rust_flow_accumulation_available():
+        if heartbeat_callback is not None:
+            heartbeat_callback("汇流累积：开始调用 Rust 拓扑传播内核。")
+        accumulation = compute_flow_accumulation_rust(
+            direction_array.astype(np.int8, copy=False),
+            progress_callback=heartbeat_callback,
+        )
+        _emit_row_progress(
+            index_progress_callback,
+            height,
+            "汇流依赖索引：Rust 内核已完成 {index}/{total} 行索引等效工作。",
+        )
+        if propagate_progress_callback is not None:
+            for progress_index in range(16):
+                propagate_progress_callback(
+                    f"汇流传播：Rust 内核已完成 {progress_index + 1}/16 个进度分片。"
+                )
+        return accumulation.astype(np.float32, copy=False)
+
     downstream_row = np.full((height, width), -1, dtype=np.int32)
     downstream_column = np.full((height, width), -1, dtype=np.int32)
     indegree = np.zeros((height, width), dtype=np.int32)
     accumulation = np.ones((height, width), dtype=np.float32)
-    next_heartbeat_at = monotonic() + 0.75
+    active_mask = direction_array >= 0
+    if heartbeat_callback is not None:
+        heartbeat_callback("汇流依赖索引：开始向量化构建下游索引。")
 
-    for row_index in range(height):
-        for column_index in range(width):
-            next_heartbeat_at = _emit_throttled_heartbeat(
-                heartbeat_callback,
-                next_heartbeat_at,
-                f"汇流依赖索引：正在扫描第 {row_index + 1}/{height} 行。",
-            )
-            direction_index = int(direction_array[row_index, column_index])
-            if direction_index < 0:
-                continue
+    if active_mask.any():
+        row_grid, column_grid = np.indices((height, width), dtype=np.int32)
+        source_rows = row_grid[active_mask]
+        source_columns = column_grid[active_mask]
+        direction_indices = direction_array[active_mask].astype(np.intp, copy=False)
+        target_rows = source_rows + D8_ROW_DELTAS[direction_indices]
+        target_columns = source_columns + D8_COLUMN_DELTAS[direction_indices]
+        valid_targets = (
+            (target_rows >= 0)
+            & (target_rows < height)
+            & (target_columns >= 0)
+            & (target_columns < width)
+        )
+        if valid_targets.any():
+            source_rows = source_rows[valid_targets]
+            source_columns = source_columns[valid_targets]
+            target_rows = target_rows[valid_targets]
+            target_columns = target_columns[valid_targets]
+            downstream_row[source_rows, source_columns] = target_rows
+            downstream_column[source_rows, source_columns] = target_columns
+            np.add.at(indegree, (target_rows, target_columns), 1)
 
-            row_delta, column_delta = D8_OFFSETS[direction_index]
-            neighbor_row = row_index + row_delta
-            neighbor_column = column_index + column_delta
-            if neighbor_row < 0 or neighbor_row >= height or neighbor_column < 0 or neighbor_column >= width:
-                continue
-
-            downstream_row[row_index, column_index] = neighbor_row
-            downstream_column[row_index, column_index] = neighbor_column
-            indegree[neighbor_row, neighbor_column] += 1
-
-        if index_progress_callback is not None:
-            index_progress_callback(f"汇流依赖索引：已完成 {row_index + 1}/{height} 行。")
+    _emit_row_progress(
+        index_progress_callback,
+        height,
+        "汇流依赖索引：已完成 {index}/{total} 行。",
+    )
 
     processing_queue: deque[tuple[int, int]] = deque()
-    next_heartbeat_at = monotonic() + 0.75
-    for row_index in range(height):
-        for column_index in range(width):
-            if indegree[row_index, column_index] == 0:
-                processing_queue.append((row_index, column_index))
-            next_heartbeat_at = _emit_throttled_heartbeat(
-                heartbeat_callback,
-                next_heartbeat_at,
-                f"汇流传播准备：正在收集零入度起点，第 {row_index + 1}/{height} 行。",
-            )
+    zero_indegree_rows, zero_indegree_columns = np.nonzero(indegree == 0)
+    processing_queue.extend(zip(zero_indegree_rows.tolist(), zero_indegree_columns.tolist()))
+    if heartbeat_callback is not None:
+        heartbeat_callback(
+            f"汇流传播准备：已收集 {len(processing_queue)} 个零入度起点。"
+        )
 
     processed_nodes = 0
     total_nodes = int(height * width)
@@ -2645,37 +3704,51 @@ def _trim_edge_following_channels(
 
     has_upstream_boundary = np.zeros_like(candidate_mask, dtype=bool)
     has_upstream_interior = np.zeros_like(candidate_mask, dtype=bool)
-    next_heartbeat_at = monotonic() + 0.75
+    if heartbeat_callback is not None:
+        heartbeat_callback("河道边缘终止分析：开始向量化扫描河道流向连接。")
 
-    for row_index in range(height):
-        for column_index in range(width):
-            next_heartbeat_at = _emit_throttled_heartbeat(
-                heartbeat_callback,
-                next_heartbeat_at,
-                f"河道边缘终止分析：正在扫描第 {row_index + 1}/{height} 行的流向连接。",
-            )
-            if not candidate_mask[row_index, column_index]:
-                continue
+    active_rows, active_columns = np.nonzero(candidate_mask & (direction_array >= 0))
+    if active_rows.size > 0:
+        direction_indices = direction_array[active_rows, active_columns].astype(np.intp, copy=False)
+        neighbor_rows = active_rows + D8_ROW_DELTAS[direction_indices]
+        neighbor_columns = active_columns + D8_COLUMN_DELTAS[direction_indices]
+        valid_targets = (
+            (neighbor_rows >= 0)
+            & (neighbor_rows < height)
+            & (neighbor_columns >= 0)
+            & (neighbor_columns < width)
+        )
+        if valid_targets.any():
+            active_rows = active_rows[valid_targets]
+            active_columns = active_columns[valid_targets]
+            neighbor_rows = neighbor_rows[valid_targets]
+            neighbor_columns = neighbor_columns[valid_targets]
+            connected_targets = candidate_mask[neighbor_rows, neighbor_columns]
+            if connected_targets.any():
+                active_rows = active_rows[connected_targets]
+                active_columns = active_columns[connected_targets]
+                neighbor_rows = neighbor_rows[connected_targets]
+                neighbor_columns = neighbor_columns[connected_targets]
+                source_boundary = boundary_channel_mask[active_rows, active_columns]
+                if source_boundary.any():
+                    np.logical_or.at(
+                        has_upstream_boundary,
+                        (neighbor_rows[source_boundary], neighbor_columns[source_boundary]),
+                        True,
+                    )
+                interior_boundary = ~source_boundary
+                if interior_boundary.any():
+                    np.logical_or.at(
+                        has_upstream_interior,
+                        (neighbor_rows[interior_boundary], neighbor_columns[interior_boundary]),
+                        True,
+                    )
 
-            direction_index = int(direction_array[row_index, column_index])
-            if direction_index < 0:
-                continue
-
-            row_delta, column_delta = D8_OFFSETS[direction_index]
-            neighbor_row = row_index + row_delta
-            neighbor_column = column_index + column_delta
-            if neighbor_row < 0 or neighbor_row >= height or neighbor_column < 0 or neighbor_column >= width:
-                continue
-            if not candidate_mask[neighbor_row, neighbor_column]:
-                continue
-
-            if boundary_channel_mask[row_index, column_index]:
-                has_upstream_boundary[neighbor_row, neighbor_column] = True
-            else:
-                has_upstream_interior[neighbor_row, neighbor_column] = True
-
-        if progress_callback is not None:
-            progress_callback(f"河道边缘终止分析：已完成 {row_index + 1}/{height} 行流向连接扫描。")
+    _emit_row_progress(
+        progress_callback,
+        height,
+        "河道边缘终止分析：已完成 {index}/{total} 行流向连接扫描。",
+    )
 
     keep_boundary_mask = boundary_channel_mask & (
         has_upstream_interior | ~(has_upstream_boundary | has_upstream_interior)
@@ -2697,24 +3770,104 @@ def build_channel_mask(
     channel_length_threshold: int = 1,
     progress_callback: ProgressCallback | None = None,
     heartbeat_callback: ProgressCallback | None = None,
+    parallel_work_callback: ParallelWorkCallback | None = None,
+    parallel_chunk_callback: ParallelChunkCallback | None = None,
 ) -> np.ndarray:
     """Threshold an accumulation raster into a post-processed binary channel mask."""
 
     height, width = accumulation.shape
     channel_mask = np.zeros((height, width), dtype=np.uint8)
-    next_heartbeat_at = monotonic() + 0.75
+    worker_count = _choose_parallel_tile_workers(height, width)
+    row_tiles = _build_row_tiles(height, worker_count)
+    chunk_specs = _build_row_tile_chunk_specs(
+        row_tiles,
+        height,
+        label_prefix="Rows",
+        chunk_prefix="channel",
+    )
 
-    for row_index in range(height):
-        channel_mask[row_index, :] = (accumulation[row_index, :] >= threshold).astype(np.uint8)
+    def _threshold_tile(start_row: int, end_row: int) -> tuple[int, int, np.ndarray]:
+        tile_mask = (accumulation[start_row:end_row, :] >= threshold).astype(np.uint8)
         if valid_mask is not None:
-            channel_mask[row_index, :] = np.where(valid_mask[row_index, :], channel_mask[row_index, :], 0)
-        next_heartbeat_at = _emit_throttled_heartbeat(
-            heartbeat_callback,
-            next_heartbeat_at,
-            f"河道阈值提取：正在处理第 {row_index + 1}/{height} 行，阈值 {threshold:.2f}。",
-        )
-        if progress_callback is not None:
-            progress_callback(f"河道阈值提取：已完成 {row_index + 1}/{height} 行。")
+            tile_mask = np.where(valid_mask[start_row:end_row, :], tile_mask, 0).astype(np.uint8, copy=False)
+        return start_row, end_row, tile_mask
+
+    if heartbeat_callback is not None:
+        heartbeat_callback(f"河道阈值提取：开始按 {len(row_tiles)} 个行块计算，阈值 {threshold:.2f}。")
+    _publish_parallel_plan(
+        parallel_work_callback,
+        f"Channel threshold {threshold:.2f}",
+        "row_tiles",
+        chunk_specs,
+    )
+
+    if worker_count <= 1 or len(row_tiles) <= 1:
+        for chunk_index, (start_row, end_row) in enumerate(row_tiles):
+            chunk_id, _, chunk_total = chunk_specs[chunk_index]
+            _update_parallel_chunk(
+                parallel_chunk_callback,
+                chunk_id,
+                "running",
+                0,
+                chunk_total,
+                f"Thresholding rows {start_row + 1}-{end_row}/{height}.",
+            )
+            _, _, tile_mask = _threshold_tile(start_row, end_row)
+            channel_mask[start_row:end_row, :] = tile_mask
+            _emit_tiled_row_progress(
+                progress_callback,
+                start_row,
+                end_row,
+                height,
+                "河道阈值提取：已完成 {index}/{total} 行。",
+            )
+            _update_parallel_chunk(
+                parallel_chunk_callback,
+                chunk_id,
+                "completed",
+                chunk_total,
+                chunk_total,
+                f"Finished thresholding rows {start_row + 1}-{end_row}/{height}.",
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="river-channel") as executor:
+            future_map = {
+                executor.submit(_threshold_tile, start_row, end_row): (chunk_specs[chunk_index], start_row, end_row)
+                for chunk_index, (start_row, end_row) in enumerate(row_tiles)
+            }
+            for chunk_id, _, chunk_total in chunk_specs:
+                _update_parallel_chunk(
+                    parallel_chunk_callback,
+                    chunk_id,
+                    "running",
+                    0,
+                    chunk_total,
+                    "Waiting for worker completion.",
+                )
+            for future in as_completed(future_map):
+                start_row, end_row, tile_mask = future.result()
+                chunk_spec, _, _ = future_map[future]
+                chunk_id, _, chunk_total = chunk_spec
+                channel_mask[start_row:end_row, :] = tile_mask
+                _emit_tiled_row_progress(
+                    progress_callback,
+                    start_row,
+                    end_row,
+                    height,
+                    "河道阈值提取：已完成 {index}/{total} 行。",
+                )
+                _update_parallel_chunk(
+                    parallel_chunk_callback,
+                    chunk_id,
+                    "completed",
+                    chunk_total,
+                    chunk_total,
+                    f"Finished thresholding rows {start_row + 1}-{end_row}/{height}.",
+                )
+                if heartbeat_callback is not None:
+                    heartbeat_callback(
+                        f"河道阈值提取：行块 {start_row + 1}-{end_row}/{height} 已完成，阈值 {threshold:.2f}。"
+                    )
 
     if valid_mask is not None and direction_array is not None:
         edge_contact_mask = _compute_edge_contact_mask(
@@ -2752,7 +3905,6 @@ def channel_preview_image(channel_mask: np.ndarray) -> Image.Image:
     """Render the binary channel mask as a high-contrast preview image."""
 
     height, width = channel_mask.shape
-    preview_array = np.zeros((height, width, 3), dtype=np.uint8)
-    preview_array[:, :] = np.asarray((10, 16, 20), dtype=np.uint8)
-    preview_array[channel_mask > 0] = np.asarray((121, 210, 255), dtype=np.uint8)
-    return Image.fromarray(preview_array, mode="RGB")
+    preview_array = np.zeros((height, width, 4), dtype=np.uint8)
+    preview_array[channel_mask > 0] = np.asarray((121, 210, 255, 255), dtype=np.uint8)
+    return Image.fromarray(preview_array, mode="RGBA")

@@ -42,10 +42,13 @@ from .raster_algorithms import (
     compute_d8_flow_directions,
     compute_flow_accumulation,
     direction_preview_image,
+    fill_depressions_priority_flood,
+    fill_depth_preview_image,
     fill_local_sinks,
     generate_auto_mask,
     load_height_array,
     load_mask_array,
+    rust_priority_flood_available,
     terrain_preview_image,
     terrain_statistics_message,
     DEFAULT_FILL_SINK_MAX_ITERATIONS,
@@ -59,6 +62,7 @@ ARTIFACT_LABELS = {
     "user_mask": "用户遮罩",
     "auto_mask": "自动遮罩",
     "terrain_preprocessed": "预处理地形",
+    "fill_depth": "填洼深度",
     "flow_direction": "流向",
     "flow_accumulation": "汇流累积",
     "channel_mask": "河道结果",
@@ -92,6 +96,19 @@ def ensure_parent_directory(path: Path) -> None:
     """Create the parent directory for an output file if it is missing."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def save_preview_image(image: Image.Image, path: Path, max_side: int) -> Image.Image:
+    """Save a bounded preview image and return the saved image object."""
+
+    ensure_parent_directory(path)
+    preview_image = image
+    longest_side = max(preview_image.size)
+    if longest_side > max_side:
+        preview_image = image.copy()
+        preview_image.thumbnail((max_side, max_side), Image.Resampling.BILINEAR)
+    preview_image.save(path)
+    return preview_image
 
 
 def to_project_relative_path(path: Path) -> str:
@@ -135,10 +152,15 @@ def build_default_pipeline_result(context: PipelineContext) -> PipelineResult:
             label=ARTIFACT_LABELS["terrain_preprocessed"],
             stage=PipelineStage.PREPROCESS,
         ),
+        "fill_depth": ArtifactRecord(
+            key="fill_depth",
+            label=ARTIFACT_LABELS["fill_depth"],
+            stage=PipelineStage.PREPROCESS,
+        ),
         "user_mask": ArtifactRecord(
             key="user_mask",
             label=ARTIFACT_LABELS["user_mask"],
-            stage=PipelineStage.PREPROCESS,
+            stage=PipelineStage.IO,
         ),
         "auto_mask": ArtifactRecord(
             key="auto_mask",
@@ -217,6 +239,67 @@ def get_artifact_label(key: str) -> str:
     return ARTIFACT_LABELS.get(key, key)
 
 
+def _user_mask_data_path(context: PipelineContext) -> Path:
+    """Return the persisted task-local user-mask raster path."""
+
+    return context.task_directory / "user_mask.npy"
+
+
+def _user_mask_preview_path(context: PipelineContext) -> Path:
+    """Return the persisted task-local user-mask preview path."""
+
+    return context.task_directory / "user_mask.png"
+
+
+def load_user_mask_for_shape(
+    context: PipelineContext,
+    expected_shape: tuple[int, int],
+) -> np.ndarray:
+    """Load one user mask from cache or source file and validate its raster size."""
+
+    cached_path = _user_mask_data_path(context)
+    if cached_path.exists():
+        user_mask = np.load(cached_path).astype(bool)
+    else:
+        if context.mask_path is None:
+            raise FileNotFoundError("当前任务未提供用户遮罩路径。")
+        if not context.mask_path.exists():
+            raise FileNotFoundError(f"用户遮罩栅格未找到：{context.mask_path}")
+        with Image.open(context.mask_path) as image:
+            user_mask = load_mask_array(image)
+
+    if user_mask.shape != expected_shape:
+        raise ValueError(
+            "用户遮罩栅格尺寸与地形栅格不一致："
+            f"{user_mask.shape} != {expected_shape}"
+        )
+
+    return user_mask.astype(bool, copy=False)
+
+
+def persist_user_mask_artifact(
+    context: PipelineContext,
+    user_mask: np.ndarray,
+    stage: PipelineStage,
+) -> ArtifactRecord:
+    """Persist one validated user mask and return the publishable artifact record."""
+
+    user_mask_data_path = _user_mask_data_path(context)
+    user_mask_preview_path = _user_mask_preview_path(context)
+    np.save(user_mask_data_path, user_mask.astype(np.uint8))
+    auto_mask_preview_image(user_mask).save(user_mask_preview_path)
+    return ArtifactRecord(
+        key="user_mask",
+        label=get_artifact_label("user_mask"),
+        stage=stage,
+        status=ArtifactStatus.READY,
+        path=to_project_relative_path(user_mask_data_path),
+        preview_path=to_project_relative_path(user_mask_preview_path),
+        width=int(user_mask.shape[1]),
+        height=int(user_mask.shape[0]),
+    )
+
+
 class ProgressReporter(Protocol):
     """Interface used by pipeline stages to report work without knowing the UI."""
 
@@ -237,6 +320,27 @@ class ProgressReporter(Protocol):
 
     def heartbeat(self, message: str = "", force: bool = False) -> None:
         """Refresh task liveness without requiring a progress-unit increment."""
+
+    def set_parallel_work(
+        self,
+        label: str,
+        strategy: str,
+        chunks: list[tuple[str, str, int]],
+    ) -> None:
+        """Publish one structured parallel-work snapshot for the current stage."""
+
+    def update_parallel_chunk(
+        self,
+        chunk_id: str,
+        status: str,
+        processed_units: int,
+        total_units: int,
+        detail: str = "",
+    ) -> None:
+        """Update one chunk inside the current structured parallel-work snapshot."""
+
+    def clear_parallel_work(self) -> None:
+        """Clear any structured parallel-work snapshot for the current stage."""
 
     def is_canceled(self) -> bool:
         """Return whether the task has been canceled by the user."""
@@ -319,8 +423,8 @@ class InputStageRunner:
         config: PipelineConfig,
         reporter: ProgressReporter,
     ) -> ArtifactRecord:
-        del config
-        reporter.begin_stage(self.stage, 3, "Resolving input terrain path.")
+        stage_units = 5 if context.mask_path is not None else 4
+        reporter.begin_stage(self.stage, stage_units, "Resolving input terrain path.")
         reporter.advance(1, f"Resolved input path: {context.input_path}")
 
         if not context.input_path.exists():
@@ -339,12 +443,29 @@ class InputStageRunner:
             mode,
         )
         reporter.advance(1, f"Detected raster size {width}x{height} with mode {mode}.")
-        reporter.complete_stage("Input inspection completed.")
+
+        applied_user_mask: np.ndarray | None = None
+        if context.mask_path is not None:
+            user_mask = load_user_mask_for_shape(context, (height, width))
+            reporter.publish_artifact(persist_user_mask_artifact(context, user_mask, self.stage))
+            if config.preprocess.use_mask:
+                applied_user_mask = user_mask
+                reporter.advance(
+                    1,
+                    f"已加载用户遮罩 {context.mask_path.name}，并将从输入阶段开始参与后续计算。",
+                )
+            else:
+                reporter.advance(
+                    1,
+                    f"检测到用户遮罩 {context.mask_path.name}，但当前任务未启用“用户遮罩”开关。",
+                )
 
         preview_path = context.task_directory / "input_preview.png"
         with Image.open(context.input_path) as image:
-            preview_image = self._to_preview_image(image)
-            preview_image.save(preview_path)
+            preview_image = self._to_preview_image(image, applied_user_mask)
+            save_preview_image(preview_image, preview_path, int(config.preview_max_side))
+        reporter.advance(1, f"Saved input preview to {preview_path}.")
+        reporter.complete_stage("Input inspection completed.")
 
         artifact = ArtifactRecord(
             key="input_preview",
@@ -359,16 +480,26 @@ class InputStageRunner:
         reporter.publish_artifact(artifact)
         return artifact
 
-    def _to_preview_image(self, image: Image.Image) -> Image.Image:
-        """Normalize input imagery into a stable RGB preview format."""
+    def _to_preview_image(
+        self,
+        image: Image.Image,
+        user_mask: np.ndarray | None,
+    ) -> Image.Image:
+        """Normalize input imagery into one stable preview format and optionally apply the user mask."""
 
-        if image.mode == "RGB":
-            return image.copy()
+        if user_mask is None:
+            if image.mode == "RGB":
+                return image.copy()
 
-        if image.mode == "L":
+            if image.mode == "L":
+                return image.convert("RGB")
+
             return image.convert("RGB")
 
-        return image.convert("RGB")
+        preview_rgba = image.convert("RGBA")
+        preview_array = np.asarray(preview_rgba, dtype=np.uint8).copy()
+        preview_array[~user_mask] = np.asarray((0, 0, 0, 0), dtype=np.uint8)
+        return Image.fromarray(preview_array, mode="RGBA")
 
 
 class PreprocessStageRunner:
@@ -384,11 +515,16 @@ class PreprocessStageRunner:
     ) -> ArtifactRecord:
         preview_path = context.task_directory / "terrain_preprocessed.png"
         raw_output_path = context.task_directory / "terrain_preprocessed.npy"
+        original_for_flow_path = context.task_directory / "terrain_original_for_flow.npy"
+        fill_depth_path = context.task_directory / "fill_depth.npy"
+        fill_depth_preview_path = context.task_directory / "fill_depth.png"
         valid_mask_output_path = context.task_directory / "valid_mask.npy"
         ensure_parent_directory(preview_path)
 
+        step_started_at = monotonic()
         with Image.open(context.input_path) as image:
             height_array = load_height_array(image)
+        self._log_step_timing(context, "load_height_array", step_started_at)
         stage_rows = int(height_array.shape[0])
         estimated_units = 10
         if config.preprocess.smooth and config.preprocess.smooth_kernel_size > 1:
@@ -406,18 +542,75 @@ class PreprocessStageRunner:
             config.preprocess.preserve_nodata,
             config.preprocess.nodata_value,
         )
+        step_started_at = monotonic()
         height_array = apply_height_mapping(height_array, config.preprocess.height_mapping)
+        self._log_step_timing(context, "height_mapping", step_started_at)
         reporter.advance(1, self._build_height_mapping_message(config))
-        valid_mask = self._apply_optional_auto_mask(height_array, valid_mask, context, config, reporter)
+        step_started_at = monotonic()
         valid_mask = self._apply_optional_user_mask(height_array, valid_mask, context, config, reporter)
+        self._log_step_timing(context, "user_mask", step_started_at)
+        step_started_at = monotonic()
+        valid_mask = self._apply_optional_auto_mask(height_array, valid_mask, context, config, reporter)
+        self._log_step_timing(context, "auto_mask", step_started_at)
 
-        height_array = self._apply_optional_smoothing(height_array, valid_mask, config, reporter)
-        height_array = self._apply_optional_sink_fill(height_array, valid_mask, config, reporter)
+        roi = self._build_processing_roi(valid_mask, config)
+        roi_slices = (slice(roi[0], roi[1]), slice(roi[2], roi[3]))
+        work_height_array = height_array[roi_slices].astype(np.float32, copy=True)
+        work_valid_mask = valid_mask[roi_slices].astype(bool, copy=True)
+        if roi != (0, height_array.shape[0], 0, height_array.shape[1]):
+            reporter.advance(
+                1,
+                (
+                    "ROI 优化："
+                    f"仅处理有效区域行 {roi[0] + 1}-{roi[1]}、列 {roi[2] + 1}-{roi[3]}，"
+                    f"原图 {height_array.shape[1]}x{height_array.shape[0]}。"
+                ),
+            )
+
+        step_started_at = monotonic()
+        work_height_array = self._apply_optional_smoothing(work_height_array, work_valid_mask, config, reporter)
+        self._log_step_timing(context, "smoothing", step_started_at)
+        original_for_flow_array = height_array.astype(np.float32, copy=True)
+        original_for_flow_array[roi_slices] = work_height_array
+        np.save(original_for_flow_path, original_for_flow_array.astype(np.float32))
+        step_started_at = monotonic()
+        work_height_array, work_fill_depth = self._apply_optional_sink_fill(
+            work_height_array,
+            work_valid_mask,
+            context,
+            config,
+            reporter,
+        )
+        self._log_step_timing(context, "sink_fill", step_started_at)
+        height_array = height_array.astype(np.float32, copy=True)
+        height_array[roi_slices] = work_height_array
+        fill_depth = np.zeros_like(height_array, dtype=np.float32)
+        if work_fill_depth is not None:
+            fill_depth[roi_slices] = work_fill_depth
 
         preview_image = terrain_preview_image(height_array, valid_mask)
-        preview_image.save(preview_path)
+        save_preview_image(preview_image, preview_path, int(config.preview_max_side))
         np.save(raw_output_path, height_array.astype(np.float32))
         np.save(valid_mask_output_path, valid_mask.astype(np.uint8))
+        if fill_depth is not None:
+            np.save(fill_depth_path, fill_depth.astype(np.float32))
+            save_preview_image(
+                fill_depth_preview_image(fill_depth, valid_mask),
+                fill_depth_preview_path,
+                int(config.preview_max_side),
+            )
+            reporter.publish_artifact(
+                ArtifactRecord(
+                    key="fill_depth",
+                    label=get_artifact_label("fill_depth"),
+                    stage=self.stage,
+                    status=ArtifactStatus.READY,
+                    path=to_project_relative_path(fill_depth_path),
+                    preview_path=to_project_relative_path(fill_depth_preview_path),
+                    width=int(fill_depth.shape[1]),
+                    height=int(fill_depth.shape[0]),
+                )
+            )
         reporter.advance(1, terrain_statistics_message(height_array, valid_mask))
         reporter.advance(1, f"Saved preprocessing artifacts to {preview_path}.")
         reporter.complete_stage("Terrain preprocessing completed.")
@@ -435,6 +628,46 @@ class PreprocessStageRunner:
         )
         reporter.publish_artifact(artifact)
         return artifact
+
+    def _log_step_timing(
+        self,
+        context: PipelineContext,
+        step_name: str,
+        started_at: float,
+    ) -> None:
+        """Write one preprocess timing line for large-raster diagnosis."""
+
+        elapsed_seconds = monotonic() - started_at
+        pipeline_logger.info(
+            "task_id=%s | stage=preprocess | step=%s | elapsed=%.3fs",
+            context.task_id,
+            step_name,
+            elapsed_seconds,
+        )
+
+    def _build_processing_roi(
+        self,
+        valid_mask: np.ndarray,
+        config: PipelineConfig,
+    ) -> tuple[int, int, int, int]:
+        """Return a padded valid-mask bounding box for expensive local preprocessing."""
+
+        height, width = valid_mask.shape
+        valid_rows, valid_columns = np.nonzero(valid_mask)
+        if valid_rows.size == 0 or valid_columns.size == 0:
+            return 0, height, 0, width
+
+        smooth_radius = (
+            int(config.preprocess.smooth_kernel_size) // 2
+            if config.preprocess.smooth and config.preprocess.smooth_kernel_size > 1
+            else 0
+        )
+        margin = max(2, smooth_radius + 2)
+        row_start = max(0, int(valid_rows.min()) - margin)
+        row_end = min(height, int(valid_rows.max()) + margin + 1)
+        column_start = max(0, int(valid_columns.min()) - margin)
+        column_end = min(width, int(valid_columns.max()) + margin + 1)
+        return row_start, row_end, column_start, column_end
 
     def _apply_optional_auto_mask(
         self,
@@ -463,7 +696,7 @@ class PreprocessStageRunner:
         auto_mask_path = context.task_directory / "auto_mask.npy"
         auto_mask_preview_path = context.task_directory / "auto_mask.png"
         np.save(auto_mask_path, auto_mask.astype(np.uint8))
-        auto_mask_preview_image(auto_mask).save(auto_mask_preview_path)
+        save_preview_image(auto_mask_preview_image(auto_mask), auto_mask_preview_path, int(config.preview_max_side))
         merged_mask = valid_mask & auto_mask
         reporter.advance(
             1,
@@ -516,6 +749,8 @@ class PreprocessStageRunner:
             config.preprocess.smooth_kernel_size,
             progress_callback=build_row_progress_callback(reporter, int(height_array.shape[0])),
             heartbeat_callback=build_heartbeat_callback(reporter),
+            parallel_work_callback=reporter.set_parallel_work,
+            parallel_chunk_callback=reporter.update_parallel_chunk,
         )
         reporter.advance(
             1,
@@ -527,14 +762,59 @@ class PreprocessStageRunner:
         self,
         height_array: np.ndarray,
         valid_mask: np.ndarray,
+        context: PipelineContext,
         config: PipelineConfig,
         reporter: ProgressReporter,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray | None]:
         """Repair closed sinks and no-outlet flat basins during preprocessing."""
 
         if not config.preprocess.fill_sinks:
             reporter.advance(1, "Skipped closed-sink and no-outlet flat repair.")
-            return height_array
+            return height_array, np.zeros_like(height_array, dtype=np.float32)
+
+        pixel_count = int(height_array.shape[0] * height_array.shape[1])
+        algorithm = config.preprocess.fill_sink_algorithm
+        use_priority_flood = algorithm == "priority_flood" or (
+            algorithm == "auto"
+            and rust_priority_flood_available()
+            and pixel_count >= int(config.preprocess.fast_fill_min_pixels)
+        )
+        max_fill_depth = config.preprocess.max_fill_depth
+        if config.preprocess.deep_basin_mode == "preserve" and max_fill_depth is None:
+            max_fill_depth = 0.0
+
+        if use_priority_flood:
+            filled_array, fill_depth = fill_depressions_priority_flood(
+                height_array,
+                valid_mask,
+                max_fill_depth=max_fill_depth,
+                progress_callback=build_row_progress_callback(reporter, max(16, int(height_array.shape[0]))),
+                heartbeat_callback=build_heartbeat_callback(reporter),
+            )
+            changed_cells = int((fill_depth > 0).sum())
+            max_depth = float(fill_depth.max(initial=0.0))
+            mean_depth = float(fill_depth[fill_depth > 0].mean()) if changed_cells > 0 else 0.0
+            reporter.advance(
+                1,
+                (
+                    "快速填洼完成："
+                    f"algorithm=priority_flood，像素 {pixel_count}，"
+                    f"修复 {changed_cells}，最大填深 {max_depth:.3f}，平均填深 {mean_depth:.3f}，"
+                    f"deep_basin_mode={config.preprocess.deep_basin_mode}。"
+                ),
+            )
+            pipeline_logger.info(
+                (
+                    "task_id=%s | stage=preprocess | step=sink_fill_audit | "
+                    "algorithm=priority_flood | pixels=%s | changed=%s | max_depth=%.3f | mean_depth=%.3f"
+                ),
+                context.task_id,
+                pixel_count,
+                changed_cells,
+                max_depth,
+                mean_depth,
+            )
+            return filled_array, fill_depth
 
         filled_array, iterations_used = fill_local_sinks(
             height_array,
@@ -545,12 +825,29 @@ class PreprocessStageRunner:
                 (int(height_array.shape[0]) + 11) * DEFAULT_FILL_SINK_MAX_ITERATIONS,
             ),
             heartbeat_callback=build_heartbeat_callback(reporter),
+            parallel_work_callback=reporter.set_parallel_work,
+            parallel_chunk_callback=reporter.update_parallel_chunk,
         )
         reporter.advance(
             1,
             f"Repaired closed sinks and no-outlet flat basins in {iterations_used} iteration(s).",
         )
-        return filled_array
+        fill_depth = np.where(
+            valid_mask,
+            np.maximum(filled_array.astype(np.float32, copy=False) - height_array.astype(np.float32, copy=False), 0.0),
+            0.0,
+        ).astype(np.float32, copy=False)
+        pipeline_logger.info(
+            (
+                "task_id=%s | stage=preprocess | step=sink_fill_audit | "
+                "algorithm=legacy | iterations=%s | changed=%s | max_depth=%.3f"
+            ),
+            context.task_id,
+            iterations_used,
+            int((fill_depth > 0).sum()),
+            float(fill_depth.max(initial=0.0)),
+        )
+        return filled_array, fill_depth
 
     def _apply_optional_user_mask(
         self,
@@ -571,38 +868,12 @@ class PreprocessStageRunner:
             reporter.advance(1, "未应用用户遮罩。")
             return valid_mask
 
-        if not context.mask_path.exists():
-            raise FileNotFoundError(f"用户遮罩栅格未找到：{context.mask_path}")
-
-        with Image.open(context.mask_path) as image:
-            user_mask = load_mask_array(image)
-
-        if user_mask.shape != height_array.shape:
-            raise ValueError(
-                "用户遮罩栅格尺寸与地形栅格不一致："
-                f"{user_mask.shape} != {height_array.shape}"
-            )
+        user_mask = load_user_mask_for_shape(context, height_array.shape)
 
         merged_mask = valid_mask & user_mask
-        user_mask_preview_path = context.task_directory / "user_mask.png"
-        user_mask_data_path = context.task_directory / "user_mask.npy"
-        np.save(user_mask_data_path, user_mask.astype(np.uint8))
-        auto_mask_preview_image(user_mask).save(user_mask_preview_path)
-        reporter.publish_artifact(
-            ArtifactRecord(
-                key="user_mask",
-                label=get_artifact_label("user_mask"),
-                stage=self.stage,
-                status=ArtifactStatus.READY,
-                path=to_project_relative_path(user_mask_data_path),
-                preview_path=to_project_relative_path(user_mask_preview_path),
-                width=int(user_mask.shape[1]),
-                height=int(user_mask.shape[0]),
-            )
-        )
         reporter.advance(
             1,
-            f"已应用用户遮罩 {context.mask_path.name}；有效像素 {int(merged_mask.sum())}。",
+            f"已在预处理起点并入用户遮罩 {context.mask_path.name}；有效像素 {int(merged_mask.sum())}。",
         )
         return merged_mask
 
@@ -619,6 +890,7 @@ class FlowDirectionStageRunner:
         reporter: ProgressReporter,
     ) -> ArtifactRecord:
         terrain_path = context.task_directory / "terrain_preprocessed.npy"
+        texture_terrain_path = context.task_directory / "terrain_original_for_flow.npy"
         valid_mask_path = context.task_directory / "valid_mask.npy"
         preview_path = context.task_directory / "flow_direction.png"
         raw_output_path = context.task_directory / "flow_direction.npy"
@@ -629,6 +901,11 @@ class FlowDirectionStageRunner:
             raise FileNotFoundError(f"Preprocessed valid mask was not found: {valid_mask_path}")
 
         terrain = np.load(terrain_path).astype(np.float32)
+        texture_terrain = (
+            np.load(texture_terrain_path).astype(np.float32)
+            if texture_terrain_path.exists()
+            else terrain
+        )
         valid_mask = np.load(valid_mask_path).astype(bool)
         total_rows = int(terrain.shape[0])
         total_nodes = int(terrain.shape[0] * terrain.shape[1])
@@ -642,6 +919,7 @@ class FlowDirectionStageRunner:
         direction_array = compute_d8_flow_directions(
             terrain,
             valid_mask=valid_mask,
+            texture_height_array=texture_terrain,
             use_rust_kernel=config.flow_direction.use_rust_kernel,
             slope_weight=config.flow_direction.slope_weight,
             flat_escape_weight=config.flow_direction.flat_escape_weight,
@@ -657,10 +935,13 @@ class FlowDirectionStageRunner:
             residual_heartbeat_callback=build_heartbeat_callback(reporter),
             cycle_progress_callback=build_row_progress_callback(reporter, cycle_units),
             cycle_heartbeat_callback=build_heartbeat_callback(reporter),
+            parallel_work_callback=reporter.set_parallel_work,
+            parallel_chunk_callback=reporter.update_parallel_chunk,
+            clear_parallel_work_callback=reporter.clear_parallel_work,
         )
 
         preview_image = direction_preview_image(direction_array)
-        preview_image.save(preview_path)
+        save_preview_image(preview_image, preview_path, int(config.preview_max_side))
         np.save(raw_output_path, direction_array.astype(np.int8))
         reporter.complete_stage("D8 flow-direction stage completed.")
         pipeline_logger.info("Flow direction raster written to '%s'.", raw_output_path)
@@ -711,10 +992,11 @@ class FlowAccumulationStageRunner:
             index_progress_callback=build_row_progress_callback(reporter, total_rows),
             propagate_progress_callback=build_row_progress_callback(reporter, propagation_units),
             heartbeat_callback=build_heartbeat_callback(reporter),
+            use_rust_kernel=config.flow_accumulation.use_rust_kernel,
         )
 
         preview_image = accumulation_preview_image(accumulation, config.flow_accumulation.normalize)
-        preview_image.save(preview_path)
+        save_preview_image(preview_image, preview_path, int(config.preview_max_side))
         np.save(raw_output_path, accumulation.astype(np.float32))
         reporter.complete_stage("Flow accumulation stage completed.")
         pipeline_logger.info("Flow accumulation raster written to '%s'.", raw_output_path)
@@ -780,13 +1062,20 @@ class ChannelExtractStageRunner:
             channel_length_threshold=channel_length_threshold,
             progress_callback=build_row_progress_callback(reporter, stage_units),
             heartbeat_callback=build_heartbeat_callback(reporter),
+            parallel_work_callback=reporter.set_parallel_work,
+            parallel_chunk_callback=reporter.update_parallel_chunk,
         )
 
         preview_image = channel_preview_image(channel_mask)
-        preview_image.save(preview_path)
+        saved_preview_image = save_preview_image(preview_image, preview_path, int(config.preview_max_side))
         np.save(raw_output_path, channel_mask.astype(np.uint8))
         np.save(context.output_path.with_suffix(".npy"), channel_mask.astype(np.uint8))
-        preview_image.save(context.output_path)
+        final_output_image = (
+            preview_image
+            if context.output_path.suffix.lower() in {".png", ".webp"}
+            else preview_image.convert("RGB")
+        )
+        final_output_image.save(context.output_path)
         reporter.complete_stage("Channel extraction stage completed.")
         pipeline_logger.info("Channel mask written to '%s'.", raw_output_path)
 
@@ -802,6 +1091,67 @@ class ChannelExtractStageRunner:
         )
         reporter.publish_artifact(artifact)
         return artifact
+
+
+class ArtifactCapturingReporter:
+    """Forward progress calls while remembering artifacts emitted inside a stage."""
+
+    def __init__(
+        self,
+        delegate: ProgressReporter,
+        captured_artifacts: list[ArtifactRecord],
+    ) -> None:
+        self._delegate = delegate
+        self._captured_artifacts = captured_artifacts
+
+    def begin_stage(self, stage: PipelineStage, total_units: int, message: str) -> None:
+        self._delegate.begin_stage(stage, total_units, message)
+
+    def advance(self, units: int = 1, message: str = "") -> None:
+        self._delegate.advance(units, message)
+
+    def complete_stage(self, message: str = "") -> None:
+        self._delegate.complete_stage(message)
+
+    def log(self, message: str) -> None:
+        self._delegate.log(message)
+
+    def publish_artifact(self, artifact: ArtifactRecord) -> None:
+        self._captured_artifacts.append(artifact)
+        self._delegate.publish_artifact(artifact)
+
+    def heartbeat(self, message: str = "", force: bool = False) -> None:
+        self._delegate.heartbeat(message, force=force)
+
+    def set_parallel_work(
+        self,
+        label: str,
+        strategy: str,
+        chunks: list[tuple[str, str, int]],
+    ) -> None:
+        self._delegate.set_parallel_work(label, strategy, chunks)
+
+    def update_parallel_chunk(
+        self,
+        chunk_id: str,
+        status: str,
+        processed_units: int,
+        total_units: int,
+        detail: str = "",
+    ) -> None:
+        self._delegate.update_parallel_chunk(
+            chunk_id,
+            status,
+            processed_units,
+            total_units,
+            detail,
+        )
+
+    def clear_parallel_work(self) -> None:
+        self._delegate.clear_parallel_work()
+
+    def is_canceled(self) -> bool:
+        return self._delegate.is_canceled()
 
 
 class RiverPipeline:
@@ -860,7 +1210,15 @@ class RiverPipeline:
             if stage_index > end_index:
                 break
 
-            artifact = stage_runner.run(context, config, reporter)
+            captured_artifacts: list[ArtifactRecord] = []
+            stage_reporter = ArtifactCapturingReporter(reporter, captured_artifacts)
+            artifact = stage_runner.run(context, config, stage_reporter)
+            for captured_artifact in captured_artifacts:
+                result = update_result_with_artifact(
+                    result,
+                    captured_artifact,
+                    context.metadata_path,
+                )
             result = update_result_with_artifact(result, artifact, context.metadata_path)
             if stage_index == end_index:
                 reporter.log(f"任务已按请求在 {stage_runner.stage.value} 阶段结束。")

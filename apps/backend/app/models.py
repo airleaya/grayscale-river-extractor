@@ -88,6 +88,10 @@ class PreprocessConfig(BaseModel):
     smooth: bool = True
     smooth_kernel_size: int = Field(default=3, ge=1, le=15)
     fill_sinks: bool = True
+    fill_sink_algorithm: Literal["auto", "legacy", "priority_flood"] = "auto"
+    max_fill_depth: float | None = Field(default=None, ge=0.0, le=255.0)
+    deep_basin_mode: Literal["fill", "preserve", "mark"] = "mark"
+    fast_fill_min_pixels: int = Field(default=8_000_000, ge=1)
     preserve_nodata: bool = True
     nodata_value: float | None = Field(default=None, ge=0.0, le=255.0)
     use_auto_mask: bool = False
@@ -114,6 +118,7 @@ class FlowAccumulationConfig(BaseModel):
     """Configuration for flow accumulation."""
 
     normalize: bool = True
+    use_rust_kernel: bool = True
 
 
 class ChannelExtractConfig(BaseModel):
@@ -137,6 +142,7 @@ class PipelineConfig(BaseModel):
     channel_extract: ChannelExtractConfig = Field(default_factory=ChannelExtractConfig)
     save_intermediates: bool = True
     total_tiles: int = Field(default=64, ge=4, le=4096)
+    preview_max_side: int = Field(default=4096, ge=512, le=8192)
 
 
 class RiverTaskRequest(BaseModel):
@@ -220,6 +226,38 @@ class ContinueTaskRequest(BaseModel):
     inherit_stage_outputs: list[PipelineStage] | None = None
 
 
+class ParallelChunkStatus(str, Enum):
+    """Stable lifecycle states for one parallel work chunk."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+
+
+class ParallelChunkProgress(BaseModel):
+    """Serializable progress snapshot for one chunk of parallel work."""
+
+    chunk_id: str
+    label: str
+    status: ParallelChunkStatus = ParallelChunkStatus.PENDING
+    processed_units: int = Field(default=0, ge=0)
+    total_units: int = Field(default=1, ge=1)
+    percent: float = Field(default=0.0, ge=0.0, le=100.0)
+    detail: str = ""
+
+
+class ParallelWorkProgress(BaseModel):
+    """Serializable snapshot of the current stage's chunked parallel work."""
+
+    label: str
+    strategy: str
+    processed_units: int = Field(default=0, ge=0)
+    total_units: int = Field(default=1, ge=1)
+    completed_chunks: int = Field(default=0, ge=0)
+    total_chunks: int = Field(default=0, ge=0)
+    chunks: list[ParallelChunkProgress] = Field(default_factory=list)
+
+
 class TaskProgress(BaseModel):
     """
     Fine-grained progress information for the current stage.
@@ -236,6 +274,7 @@ class TaskProgress(BaseModel):
     eta_seconds: float | None = Field(default=None, ge=0.0)
     last_heartbeat_at: datetime | None = None
     last_heartbeat_message: str = ""
+    parallel_work: ParallelWorkProgress | None = None
 
 
 class ArtifactStatus(str, Enum):
